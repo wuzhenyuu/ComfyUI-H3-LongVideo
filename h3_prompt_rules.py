@@ -90,10 +90,10 @@ def validate_video_material(material):
 
 
 def validate_material(material):
-    """Reject unsupported generation lengths before a provider is called."""
+    """Validate duration metadata without imposing a prompt-writing length cap."""
     seconds = material.get('generation_seconds')
-    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or not 4 <= seconds <= 15:
-        raise ValueError('实际 generation_seconds 必须在 4–15 秒内；请先调整分段，不能用原始音频时长替代生成时长。')
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError('实际 generation_seconds 必须是有限正数；提示词校验不设 15 秒上限。')
     frames = material.get('generation_frames')
     if frames is not None and (isinstance(frames, bool) or not isinstance(frames, int) or frames <= 0 or abs(frames/24-seconds) > 1e-6):
         raise ValueError('generation_seconds 必须与实际 generation_frames / 24 一致。')
@@ -619,8 +619,9 @@ def _check_ref2va(text: str, report: Report) -> None:
 
 def validate_prompt(text: str, mode: str, duration: float) -> Report:
     report = Report()
-    if not 4 <= duration <= 15:
-        report.errors.append("Duration must be between 4 and 15 seconds")
+    if isinstance(duration, bool) or not isinstance(duration, (int, float)) or not math.isfinite(duration) or duration <= 0:
+        report.errors.append("Duration must be a finite positive number")
+        return report
     if not text.strip():
         report.errors.append("Prompt is empty")
         return report

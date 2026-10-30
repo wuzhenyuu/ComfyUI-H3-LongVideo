@@ -1,5 +1,6 @@
 """Chinese Ref2VA contracts and metadata gates; no model service is called."""
 import copy
+import importlib
 import json
 from pathlib import Path
 import tempfile
@@ -10,6 +11,7 @@ import test_materials as fixtures
 
 expansion = fixtures.expansion
 rules = expansion.h3_prompt_rules
+cli = importlib.import_module('h3lv_test.codex_cli')
 
 
 def audio_prompt():
@@ -83,18 +85,75 @@ class H3PromptRulesTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaisesRegex(ValueError, 'N/A'):
                 expansion.validate_prompt(text, 1)
 
-    def test_actual_generation_duration_is_checked_before_any_provider_request(self):
-        for seconds in (3.99, 15.01, float('nan'), True, None):
-            material = {**self.material, 'generation_seconds': seconds}
-            with self.subTest(seconds=seconds), patch.object(expansion, 'call') as provider:
-                with self.assertRaisesRegex(ValueError, 'generation_seconds'):
+    def test_positive_generation_durations_reach_api_and_codex_without_fixed_limits(self):
+        cases = ((362/24, 362), (18, 432), (0.5, 12), (3.99, None), (15.01, None))
+        cli_profile = {'cli_identity': {'backend': 'fixture'}}
+        for seconds, frames in cases:
+            for provider in ('api', 'codex_cli'):
+                material = {**self.material, 'generation_seconds': seconds, 'generation_frames': frames}
+                profile = self.profile if provider == 'api' else cli_profile
+                with self.subTest(seconds=seconds, provider=provider), \
+                     patch.object(expansion, 'call', return_value={'choices': [{'message': {'content': fixtures.TEXT}}]}) as api, \
+                     patch.object(cli, 'generate', return_value=fixtures.TEXT) as codex:
+                    result = expansion.expand(material, 'text', 'fixture', '规则',
+                                              provider=provider, request_profile=profile,
+                                              cancelled=lambda: False)
+                    self.assertEqual(result, fixtures.TEXT)
+                    if provider == 'api':
+                        api.assert_called_once()
+                        codex.assert_not_called()
+                        payload = api.call_args.args[1]['messages'][1]['content'][0]['text']
+                        context = json.loads(payload)
+                        self.assertEqual(context['generation_seconds'], seconds)
+                        self.assertEqual(context['generation_frames'], frames)
+                    else:
+                        codex.assert_called_once()
+                        api.assert_not_called()
+                        payload = codex.call_args.args[0].split('分段素材包：\n', 1)[1]
+                        context = json.loads(payload)
+                        self.assertEqual(context['generation_seconds'], seconds)
+                        self.assertEqual(context['generation_frames'], frames)
+
+    def test_invalid_generation_durations_fail_before_any_provider_request(self):
+        invalid = (0, -1, float('nan'), float('inf'), -float('inf'), True, False, None, '18', [], {})
+        for seconds in invalid:
+            for provider in ('api', 'codex_cli'):
+                material = {**self.material, 'generation_seconds': seconds}
+                with self.subTest(seconds=seconds, provider=provider), \
+                     patch.object(expansion, 'call') as api, patch.object(cli, 'generate') as codex:
+                    with self.assertRaisesRegex(ValueError, 'generation_seconds'):
+                        expansion.expand(material, 'text', 'fixture', '规则',
+                                         provider=provider, request_profile=self.profile)
+                    api.assert_not_called()
+                    codex.assert_not_called()
+
+    def test_generation_frame_metadata_still_requires_positive_matching_integer(self):
+        for seconds, frames in ((10, 242), (362/24, 360), (18, 0), (18, -432),
+                                (18, True), (18, 432.0), (18, '432')):
+            material = {**self.material, 'generation_seconds': seconds, 'generation_frames': frames}
+            with self.subTest(seconds=seconds, frames=frames), \
+                 patch.object(expansion, 'call') as api, patch.object(cli, 'generate') as codex:
+                with self.assertRaisesRegex(ValueError, 'generation_frames / 24'):
                     expansion.expand(material, 'text', 'fixture', '规则', request_profile=self.profile)
-                provider.assert_not_called()
-        material = {**self.material, 'generation_seconds': 10}
-        with self.assertRaisesRegex(ValueError, 'generation_frames / 24'):
-            expansion.validate_prompt(fixtures.TEXT, 1, material)
+                api.assert_not_called()
+                codex.assert_not_called()
         # The audio clip's original length must not replace the actual generation length.
         expansion.validate_prompt(fixtures.TEXT, 1, {**self.material, 'duration': 500})
+
+    def test_generic_validator_accepts_positive_duration_without_fixed_limits(self):
+        for seconds in (362/24, 18, 0.5, 3.99, 15.01):
+            with self.subTest(seconds=seconds):
+                report = rules.validate_prompt(fixtures.TEXT, 'ref2va', seconds)
+                self.assertTrue(report.ok, report.errors)
+
+    def test_generic_validator_reports_invalid_duration_without_type_errors(self):
+        invalid = (0, -1, float('nan'), float('inf'), -float('inf'), True, False, None, '18', [], {})
+        for seconds in invalid:
+            for mode in ('ref2va', 't2va'):
+                with self.subTest(seconds=seconds, mode=mode):
+                    report = rules.validate_prompt(fixtures.TEXT, mode, seconds)
+                    self.assertFalse(report.ok)
+                    self.assertTrue(any('duration' in error.lower() for error in report.errors), report.errors)
 
     def test_audio_requires_confirmed_performance_slot_and_valid_tracking(self):
         text = audio_prompt()

@@ -469,16 +469,26 @@ class ExpansionJobsTests(unittest.TestCase):
 
     def test_invalid_h3_response_or_duration_fails_only_affected_batch_items(self):
         items = self.items(3)
-        items[0]['material'].update(generation_seconds=16, generation_frames=384)
+        items[0]['material'].update(generation_seconds=0, generation_frames=0)
         def provider(path, payload, **kwargs):
             if 'brief 1' in payload['messages'][1]['content'][0]['text']:
                 return {'choices': [{'message': {'content': fixtures.TEXT.replace('fully_preserved', 'bad_marker')}}]}
             return ANSWER
         with patch.object(expansion, 'call', side_effect=provider) as request:
             final = self.wait(self.start(items, concurrency=1))
-        self.assertEqual(request.call_count, 2, 'Out-of-range generation must never call a provider')
+        self.assertEqual(request.call_count, 2, 'Invalid duration metadata must never call a provider')
         self.assertEqual([item['status'] for item in final['items']], ['failed', 'failed', 'succeeded'])
         self.assertFalse(list((self.directory/'cache').glob(final['items'][1]['key']+'.json')))
+
+    def test_batch_expansion_accepts_frame_rounded_and_longer_shot_durations(self):
+        items = self.items(2)
+        for item, frames in zip(items, (362, 432)):
+            item['material'].update(generation_seconds=frames/24, generation_frames=frames)
+        with patch.object(expansion, 'call', return_value=ANSWER) as request:
+            final = self.wait(self.start(items, concurrency=1))
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual([item['status'] for item in final['items']], ['succeeded', 'succeeded'])
+        self.assertEqual([item['material']['generation_seconds'] for item in final['items']], [362/24, 18])
 
     def test_confirmed_audio_metadata_survives_batch_material_snapshot(self):
         packet = self.packet(0)
