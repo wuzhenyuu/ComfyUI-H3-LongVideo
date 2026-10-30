@@ -14,6 +14,9 @@ from PIL import Image
 import psutil
 import test_materials as fixtures
 
+from test_expansion_fixtures import chinese_prompt
+TEXT = chinese_prompt()
+
 expansion = fixtures.expansion
 cli = importlib.import_module('h3lv_test.codex_cli')
 
@@ -43,10 +46,10 @@ class CodexExpansionTests(unittest.TestCase):
     def test_cli_vision_keeps_picture_order_and_needs_no_api_profile(self):
         with patch.object(expansion, 'public_settings', side_effect=AssertionError('API accessed')), \
              patch.object(expansion, 'call', side_effect=AssertionError('API called')), \
-             patch.object(cli, 'generate', return_value=fixtures.TEXT) as generate:
+             patch.object(cli, 'generate', return_value=TEXT) as generate:
             result = expansion.PromptExpand().run(self.packet, 'vision', 'unused-api-model', 'fixture rule',
                 provider='codex_cli', codex_model='gpt-fixture', codex_reasoning='high')
-            self.assertEqual(result['result'], (fixtures.TEXT,))
+            self.assertEqual(result['result'], (TEXT,))
             prompt, images = generate.call_args.args
             self.assertEqual(images, self.packet['paths'])
             self.assertIn('<Picture 1>是人物', prompt)
@@ -54,11 +57,11 @@ class CodexExpansionTests(unittest.TestCase):
             self.assertEqual(generate.call_args.kwargs['model'], 'gpt-fixture')
             self.assertEqual(generate.call_args.kwargs['reasoning'], 'high')
             self.assertEqual(expansion.PromptExpand().run(self.packet, 'vision', 'unused-api-model', 'fixture rule',
-                provider='codex_cli', codex_model='gpt-fixture', codex_reasoning='high')['result'], (fixtures.TEXT,))
+                provider='codex_cli', codex_model='gpt-fixture', codex_reasoning='high')['result'], (TEXT,))
             generate.assert_called_once()
 
     def test_text_mode_does_not_send_images(self):
-        with patch.object(cli, 'generate', return_value=fixtures.TEXT) as generate:
+        with patch.object(cli, 'generate', return_value=TEXT) as generate:
             expansion.expand(self.packet, 'text', 'unused', 'rule', provider='codex_cli')
             self.assertEqual(generate.call_args.args[1], [])
 
@@ -82,7 +85,7 @@ class CodexExpansionTests(unittest.TestCase):
         self.assertFalse(list((self.directory/'cache').glob('*.json')))
 
     def test_cli_invalid_ref2va_retention_never_becomes_a_success_cache(self):
-        bad = fixtures.TEXT.replace('fully_preserved', 'bad_marker')
+        bad = TEXT.replace('fully_preserved', 'bad_marker')
         with patch.object(cli, 'generate', return_value=bad) as generate:
             with self.assertRaisesRegex(ValueError, 'retention|marker'):
                 expansion.expand(self.packet, 'text', 'unused', 'rule', provider='codex_cli')
@@ -170,7 +173,7 @@ class CodexExpansionTests(unittest.TestCase):
     def test_batch_cli_identity_is_used_for_key_and_forwarded_to_runner(self):
         profile = {'cli_identity': {'config_hash': 'original', 'model': '', 'reasoning': 'default'}}
         with patch.object(cli, 'identity', side_effect=AssertionError('Live CLI identity reread')), \
-             patch.object(cli, 'generate', return_value=fixtures.TEXT) as generate:
+             patch.object(cli, 'generate', return_value=TEXT) as generate:
             original = expansion.cache_key(self.packet, 'text', 'unused', 'rule', 0,
                                            profile=profile, provider='codex_cli')
             info = {}

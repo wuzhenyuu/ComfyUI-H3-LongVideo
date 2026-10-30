@@ -20,6 +20,10 @@ TEXT = ('subject_definitions:\n<Subject 1> 是来自 <Picture 1> 的场景、光
         'retention_analysis:\n<Subject 1>：fully_preserved - 保留场景布局与材质。\n\n'
         'detailed_description:\n'+STYLE+'\n[Shot 1] '+SHOT_BODY+'\n'+expansion.h3_prompt_rules.NO_OVERLAY+'\n\n'
         'overall_soundscape:\nN/A\n\nnon_diegetic_music:\nN/A')
+MULTI_TEXT = ('subject_definitions:\n<Subject 1> from <Picture 1>. <Picture 2> supplies the scene and composition. <Audio 1> is singing.\n'
+              'summary:\nOne shot follows <Audio 1>.\nretention_analysis:\nKeep scene.\n'
+              'detailed_description:\n[Shot 1] Move.\noverall_soundscape:\nN/A\nnon_diegetic_music:\nN/A')
+GENERATED_MULTI_TEXT = TEXT.replace('来自 <Picture 1>', '来自 <Picture 1>、<Picture 2>')
 
 class MaterialTests(unittest.TestCase):
     def setUp(self):
@@ -77,6 +81,27 @@ class MaterialTests(unittest.TestCase):
         self.assertEqual(packet['material_note'], '')
         self.assertEqual(len(packet['paths']), 2)
 
+    def test_ready_music_emotion_is_a_separate_public_condition_for_explicit_requests(self):
+        row = self.plan['segments'][0]
+        row.update(shot_request='@图1人物向左走', prompt='conflicting historical camera direction')
+        analysis = dict(labels=['期待'], intensity=2.5, trend='逐步增强', summary='轻柔而充满期待',
+                        melody='旋律舒展', rhythm='节拍均匀', timbre='音色柔和', vocal='演唱轻柔',
+                        lyrics='识别歌词表达等待', uncertainty='主观估计')
+        row['music_emotion'] = {'status': 'ready', 'analysis': {**analysis, 'raw_text': 'private raw'},
+                                'source_path': 'private.wav', 'input': {'source_sha256': 'private hash'}}
+        packet = materials.packet(self.plan, row, self.directory)
+        self.assertEqual(packet['brief'], '')
+        self.assertEqual(packet['material_note'], row['shot_request'])
+        self.assertEqual(packet['music_emotion'], analysis)
+        self.assertNotIn('private', json.dumps(packet['music_emotion']))
+        packet['music_emotion']['labels'].append('changed copy')
+        self.assertEqual(row['music_emotion']['analysis']['labels'], ['期待'])
+
+    def test_stale_music_emotion_is_excluded_from_material_packet(self):
+        row = self.plan['segments'][0]
+        row['music_emotion'] = {'status': 'stale', 'analysis': {'summary': 'old emotion'}}
+        self.assertNotIn('music_emotion', materials.packet(self.plan, row, self.directory))
+
     def test_images_remain_ordered_and_individual_sizes(self):
         packet = materials.packet(self.plan,self.plan['segments'][0],self.directory)
         images = materials.images(packet)
@@ -115,8 +140,8 @@ class MaterialTests(unittest.TestCase):
     def test_vision_cache_and_context_invalidation(self):
         packet = materials.packet(self.plan,self.plan['segments'][0],self.directory)
         packet['material_note'] = '@图1是人物，@图2是环境'
-        with patch.object(expansion,'public_settings',return_value={'base_url':'https://example.test/v1'}), patch.object(expansion,'call',return_value={'choices':[{'message':{'content':TEXT}}]}) as call:
-            self.assertEqual(expansion.expand(packet,'vision','m','r'),TEXT)
+        with patch.object(expansion,'public_settings',return_value={'base_url':'https://example.test/v1'}), patch.object(expansion,'call',return_value={'choices':[{'message':{'content':GENERATED_MULTI_TEXT}}]}) as call:
+            self.assertEqual(expansion.expand(packet,'vision','m','r'),GENERATED_MULTI_TEXT)
             expansion.expand(packet,'vision','m','r')
             self.assertEqual(call.call_count,1)
             content = call.call_args.args[1]['messages'][1]['content']
@@ -160,13 +185,13 @@ class MaterialTests(unittest.TestCase):
 
     def test_missing_single_shot_label_is_repaired(self):
         missing_label = TEXT.replace('[Shot 1] ', '')
-        result = expansion.validate_prompt(missing_label, 2)
+        result = expansion.validate_prompt(missing_label, 1)
         self.assertEqual(result.count('[Shot 1]'), 1)
         self.assertIn('detailed_description:\n'+STYLE+'\n[Shot 1] '+SHOT_BODY, result)
 
     def test_summary_shot_label_is_removed_when_detail_has_single_shot(self):
         duplicated_in_summary = TEXT.replace('summary:\n'+SUMMARY, 'summary:\n[Shot 1] '+SUMMARY)
-        result = expansion.validate_prompt(duplicated_in_summary, 2)
+        result = expansion.validate_prompt(duplicated_in_summary, 1)
         self.assertEqual(result.count('[Shot 1]'), 1)
         self.assertIn('summary:\n'+SUMMARY, result)
         self.assertIn('detailed_description:\n'+STYLE+'\n[Shot 1] '+SHOT_BODY, result)
@@ -183,7 +208,7 @@ class MaterialTests(unittest.TestCase):
         }
         for name, prompt in cases.items():
             with self.subTest(name=name):
-                result = expansion.validate_prompt(prompt, 2)
+                result = expansion.validate_prompt(prompt, 1)
                 self.assertEqual(result.count('[Shot 1]'), 1)
                 self.assertIn('[Shot 1] '+SHOT_BODY, result)
                 self.assertEqual(
@@ -197,7 +222,7 @@ class MaterialTests(unittest.TestCase):
                 continue
             with self.subTest(heading=heading):
                 prompt = TEXT.replace(f'{heading}:\n', f'{heading}:\n**[SHOT #1]**: ', 1)
-                result = expansion.validate_prompt(prompt, 2)
+                result = expansion.validate_prompt(prompt, 1)
                 self.assertEqual(result.count('[Shot 1]'), 1)
                 self.assertIn('[Shot 1] '+SHOT_BODY, result)
                 self.assertNotIn('[SHOT #1]', result)
@@ -205,7 +230,7 @@ class MaterialTests(unittest.TestCase):
     def test_duplicate_single_shot_labels_are_rejected(self):
         duplicate = TEXT.replace('[Shot 1] '+SHOT_BODY, '[Shot 1] '+SHOT_BODY+'\n[Shot 1] 继续移动。')
         with self.assertRaisesRegex(ValueError, '\\[Shot 1\\]'):
-            expansion.validate_prompt(duplicate, 2)
+            expansion.validate_prompt(duplicate, 1)
 
     def test_noncanonical_multi_shot_and_duplicate_detail_are_rejected(self):
         prompts = {
@@ -215,12 +240,12 @@ class MaterialTests(unittest.TestCase):
         }
         for name, prompt in prompts.items():
             with self.subTest(name=name), self.assertRaisesRegex(ValueError, '\\[Shot 1\\]'):
-                expansion.validate_prompt(prompt, 2)
+                expansion.validate_prompt(prompt, 1)
 
     def test_malformed_bracketed_shot_label_is_rejected(self):
         malformed = TEXT.replace('[Shot 1] '+SHOT_BODY, '[Shot one] '+SHOT_BODY)
         with self.assertRaisesRegex(ValueError, '\\[Shot 1\\]'):
-            expansion.validate_prompt(malformed, 2)
+            expansion.validate_prompt(malformed, 1)
 
     def test_cache_source_reports_exact_match_only(self):
         packet = materials.packet(self.plan,self.plan['segments'][0],self.directory)
@@ -230,9 +255,9 @@ class MaterialTests(unittest.TestCase):
             cache = Path(packet['cache_dir']); cache.mkdir(parents=True)
             (cache/(key+'.json')).write_text('{"text":"cached"}',encoding='utf-8')
             self.assertEqual(expansion.cache_source(packet,key,'vision'),'api')
-            (cache/(key+'.json')).write_text(json.dumps({'text':TEXT}),encoding='utf-8')
+            (cache/(key+'.json')).write_text(json.dumps({'text':GENERATED_MULTI_TEXT}),encoding='utf-8')
             self.assertEqual(expansion.cache_source(packet,key,'vision'),'cache')
-            packet.update(expanded_key=key, expanded_prompt=TEXT)
+            packet.update(expanded_key=key, expanded_prompt=GENERATED_MULTI_TEXT)
             self.assertEqual(expansion.cache_source(packet,key,'vision'),'saved')
 
     def test_secret_not_returned_and_host_change_clears_old_key(self):
@@ -270,12 +295,12 @@ class MaterialTests(unittest.TestCase):
 
     def test_stale_prompt_override_is_not_reused(self):
         packet = materials.packet(self.plan,self.plan['segments'][0],self.directory)
-        with patch.object(expansion,'public_settings',return_value={'base_url':'https://example.test/v1'}), patch.object(expansion,'call',return_value={'choices':[{'message':{'content':TEXT}}]}) as call:
+        with patch.object(expansion,'public_settings',return_value={'base_url':'https://example.test/v1'}), patch.object(expansion,'call',return_value={'choices':[{'message':{'content':GENERATED_MULTI_TEXT}}]}) as call:
             packet['expanded_key'] = expansion.cache_key(packet,'vision','m','r',0)
-            packet['expanded_prompt'] = TEXT.replace('保留场景布局与材质。','保留场景布局与用户调整。')
+            packet['expanded_prompt'] = GENERATED_MULTI_TEXT.replace('保留场景布局与材质。','保留场景布局与用户调整。')
             self.assertIn('用户调整',expansion.expand(packet,'vision','m','r'))
             call.assert_not_called()
-            packet['brief'] += ' changed'
+            packet['material_note'] += ' changed'
             self.assertNotIn('用户调整',expansion.expand(packet,'vision','m','r'))
             call.assert_called_once()
 

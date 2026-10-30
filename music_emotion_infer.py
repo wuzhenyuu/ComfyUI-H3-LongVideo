@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+from time import perf_counter
 
 os.environ["HF_HUB_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
@@ -236,7 +237,58 @@ def load_model_config(model_class, request):
     return config
 
 
+def log_performance(stage, started=None, **values):
+    if started is not None:
+        values["elapsed_ms"] = round((perf_counter() - started) * 1000, 3)
+    print("MOSS-Music performance " + json.dumps({"stage": stage, **values}, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def log_cuda_memory(stage, device):
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    initialized = torch.cuda.is_initialized()
+    values = {
+        "device": str(device), "cuda_initialized": initialized,
+        "allocated_bytes": 0, "reserved_bytes": 0, "peak_allocated_bytes": 0, "peak_reserved_bytes": 0,
+        "free_bytes": None, "total_bytes": None,
+    }
+    if initialized:
+        free, total = torch.cuda.mem_get_info(device)
+        values.update(
+            allocated_bytes=torch.cuda.memory_allocated(device), reserved_bytes=torch.cuda.memory_reserved(device),
+            peak_allocated_bytes=torch.cuda.max_memory_allocated(device), peak_reserved_bytes=torch.cuda.max_memory_reserved(device),
+            free_bytes=free, total_bytes=total,
+        )
+    log_performance(stage, **values)
+
+
+def release_cuda_cache(device, stage):
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_initialized():
+        return
+    try:
+        log_cuda_memory(stage + "_before_cache_release", device)
+        # Only this process's unused allocator blocks are released; active weights stay resident.
+        with torch.cuda.device(device):
+            torch.cuda.empty_cache()
+        log_cuda_memory(stage + "_after_cache_release", device)
+    except RuntimeError as error:
+        log_performance(stage + "_cache_release_failed", error_type=type(error).__name__)
+
+
+def log_parameter_storage(model):
+    by_dtype = {}
+    for parameter in model.parameters():
+        dtype = str(parameter.dtype)
+        by_dtype[dtype] = by_dtype.get(dtype, 0) + parameter.numel() * parameter.element_size()
+    log_performance("model_parameters", parameter_bytes_by_dtype=by_dtype, parameter_bytes=sum(by_dtype.values()))
+
+
 def load_model(request):
+    started = perf_counter()
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    log_cuda_memory("model_load_before", device)
     options = {
         "trust_remote_code": True,
         "local_files_only": True,
@@ -249,48 +301,81 @@ def load_model(request):
     )
     model = model_class.from_pretrained(
         request["model_path"], config=load_model_config(model_class, request),
-        torch_dtype="auto", device_map="cuda:0" if torch.cuda.is_available() else "cpu",
+        torch_dtype="auto", device_map=device,
         attn_implementation="sdpa", **options,
     )
     model.eval()
+    log_parameter_storage(model)
+    log_cuda_memory("model_load_after", device)
+    release_cuda_cache(device, "model_load")
+    log_performance("model_load", started, device=device)
     return model, processor
 
 
-def build_analysis_constraint(tokenizer, schema=ANALYSIS_SCHEMA):
-    tokenizer_data = build_token_enforcer_tokenizer_data(tokenizer)
+def build_analysis_constraint(tokenizer, schema=ANALYSIS_SCHEMA, tokenizer_data=None):
+    started = perf_counter()
+    if tokenizer_data is None:
+        tokenizer_data = build_token_enforcer_tokenizer_data(tokenizer)
     # LMFE 0.11.3 caches the minLength alphabet during parser construction.
     config = CharacterLevelParserConfig(alphabet=tokenizer_data.tokenizer_alphabet)
     parser = JsonSchemaParser(schema, config=config)
-    return build_transformers_prefix_allowed_tokens_fn(tokenizer_data, parser)
+    constraint = build_transformers_prefix_allowed_tokens_fn(tokenizer_data, parser)
+    log_performance("constraint", started)
+    return constraint
 
 
-def generate_response(model, processor, inputs, schema, max_new_tokens):
+def generate_response(model, processor, inputs, schema, max_new_tokens, tokenizer_data=None):
     inputs = inputs.to(model.device)
     if inputs.get("audio_data") is not None:
         inputs["audio_data"] = inputs["audio_data"].to(model.dtype)
         inputs["audio_input_mask"] = inputs["input_ids"] == processor.audio_token_id
-    prefix_allowed_tokens_fn = build_analysis_constraint(processor.tokenizer, schema)
-    generated_ids = model.generate(
-        **inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True,
-        prefix_allowed_tokens_fn=prefix_allowed_tokens_fn,
-    )
+    prefix_allowed_tokens_fn = build_analysis_constraint(processor.tokenizer, schema, tokenizer_data=tokenizer_data)
+    constraint_calls = 0
+    constraint_seconds = 0.0
+
+    def timed_constraint(batch_id, sent):
+        nonlocal constraint_calls, constraint_seconds
+        constraint_started = perf_counter()
+        constraint_calls += 1
+        try:
+            return prefix_allowed_tokens_fn(batch_id, sent)
+        finally:
+            constraint_seconds += perf_counter() - constraint_started
+
+    started = perf_counter()
     input_length = inputs["input_ids"].shape[1]
-    return processor.decode(generated_ids[0, input_length:], skip_special_tokens=True)
+    generated_ids = None
+    try:
+        generated_ids = model.generate(
+            **inputs, max_new_tokens=max_new_tokens, do_sample=False, num_beams=1, use_cache=True,
+            prefix_allowed_tokens_fn=timed_constraint,
+        )
+        return processor.decode(generated_ids[0, input_length:], skip_special_tokens=True)
+    finally:
+        log_performance(
+            "generation", started, mode="audio" if inputs.get("audio_data") is not None else "text",
+            input_tokens=input_length, generated_tokens=None if generated_ids is None else generated_ids.shape[1] - input_length,
+            max_new_tokens=max_new_tokens, succeeded=generated_ids is not None,
+            constraint_calls=constraint_calls, constraint_elapsed_ms=round(constraint_seconds * 1000, 3),
+        )
 
 
-def infer_segment(model, processor, samples, lyrics, max_new_tokens):
+def infer_segment(model, processor, samples, lyrics, max_new_tokens, tokenizer_data=None):
     inputs = processor(text=build_prompt(lyrics), audios=[samples], return_tensors="pt")
-    return generate_response(model, processor, inputs, ANALYSIS_SCHEMA, max_new_tokens)
+    return generate_response(model, processor, inputs, ANALYSIS_SCHEMA, max_new_tokens, tokenizer_data=tokenizer_data)
 
 
-def infer_text(model, processor, prompt, schema, max_new_tokens):
+def infer_text(model, processor, prompt, schema, max_new_tokens, tokenizer_data=None):
     inputs = processor(text=prompt, audios=None, return_tensors="pt")
     if inputs.get("audio_data") is not None:
         raise ValueError("纯文本中文转换意外产生音频输入")
-    return generate_response(model, processor, inputs, schema, max_new_tokens)
+    return generate_response(model, processor, inputs, schema, max_new_tokens, tokenizer_data=tokenizer_data)
 
 
-def localize_analysis(model, processor, analysis, max_new_tokens):
+def localize_analysis(model, processor, analysis, max_new_tokens, tokenizer_data=None):
+    rhythm = re.sub(r"(?<![A-Za-z_])bpm(?![A-Za-z0-9_])", "拍/分", analysis["rhythm"], flags=re.IGNORECASE)
+    if rhythm != analysis["rhythm"]:
+        analysis = {**analysis, "rhythm": rhythm}
     fields = translation_fields(analysis)
     if not fields:
         return validate_analysis(analysis, require_chinese=True), None
@@ -304,12 +389,15 @@ def localize_analysis(model, processor, analysis, max_new_tokens):
         "不要引用或补充歌词，不要解释翻译过程。输出一个严格 JSON 对象：\n"
         + prompt_json(fields)
     )
-    raw_text = infer_text(model, processor, prompt, translation_schema(fields), max_new_tokens)
+    started = perf_counter()
     try:
+        raw_text = infer_text(model, processor, prompt, translation_schema(fields), max_new_tokens, tokenizer_data=tokenizer_data)
         translated = parse_json_object(raw_text)
         return merge_translation(analysis, fields, translated), raw_text
     except ValueError as error:
         raise ValueError(f"纯文本中文转换失败: {error}") from error
+    finally:
+        log_performance("translation", started, field_count=len(fields))
 
 
 def run_request(request, response_path):
@@ -322,15 +410,19 @@ def run_request(request, response_path):
     atomic_json(progress_path, {"status": "loading", "done": 0, "total": len(segments), "index": None})
     print("Loading local MOSS-Music model", flush=True)
     model, processor = load_model(request)
+    started = perf_counter()
+    tokenizer_data = build_token_enforcer_tokenizer_data(processor.tokenizer)
+    log_performance("tokenizer_data", started)
     for done, segment in enumerate(segments):
         index = segment["index"]
         atomic_json(progress_path, {"status": "analyzing", "done": done, "total": len(segments), "index": index})
         raw_text = None
+        started = perf_counter()
         try:
             samples = read_segment(request["audio_path"], segment, processor.config.mel_sr)
-            raw_text = infer_segment(model, processor, samples, segment["lyrics"], request.get("max_new_tokens", 1536))
+            raw_text = infer_segment(model, processor, samples, segment["lyrics"], request.get("max_new_tokens", 1536), tokenizer_data=tokenizer_data)
             analysis = parse_analysis(raw_text)
-            analysis, translation_raw_text = localize_analysis(model, processor, analysis, request.get("max_new_tokens", 1536))
+            analysis, translation_raw_text = localize_analysis(model, processor, analysis, request.get("max_new_tokens", 1536), tokenizer_data=tokenizer_data)
             result = {"index": index, "analysis": analysis, "raw_text": raw_text}
             if translation_raw_text is not None:
                 result["translation_raw_text"] = translation_raw_text
@@ -341,6 +433,10 @@ def run_request(request, response_path):
                 failure["raw_text"] = raw_text
             response.setdefault("errors", []).append(failure)
             print(f"Segment {index} failed: {failure['error']}", file=sys.stderr, flush=True)
+        finally:
+            # Generation frames have returned or unwound before releasing unused CUDA blocks.
+            release_cuda_cache(model.device, "segment")
+            log_performance("segment", started, index=index)
         atomic_json(response_path, response)
         atomic_json(progress_path, {"status": "analyzing", "done": done + 1, "total": len(segments), "index": index})
         print(f"Segments processed: {done + 1}/{len(segments)}", flush=True)

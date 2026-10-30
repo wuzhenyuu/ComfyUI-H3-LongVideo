@@ -42,8 +42,34 @@ const options = node => ({mode:widget(node,"mode").value, model:widget(node,"mod
   codex_reasoning:widget(node,"codex_reasoning")?.value || "default",
   codex_timeout:Number(widget(node,"codex_timeout")?.value || 300)});
 
+// This evidence is sent only to the local route. The backend derives the audio flag.
+function expansionWorkflowContext(prompt, nodeId, projectId, expectedSourceId) {
+  if (!prompt || typeof prompt !== "object" || Array.isArray(prompt) || !projectId || nodeId === undefined || nodeId === null) return {};
+  const expander = prompt[String(nodeId)], material = expander?.inputs?.material;
+  if (expander?.class_type !== "H3LVPromptExpand" || !Array.isArray(material) || material.length !== 2 || material[1] !== 4) return {};
+  const sourceId = String(material[0]), source = prompt[sourceId];
+  if (source?.class_type !== "H3LVUnified" || source.inputs?.project_id !== projectId ||
+      (expectedSourceId !== undefined && sourceId !== String(expectedSourceId))) return {};
+  const references = Object.values(prompt).filter(item => item?.class_type === "MiniMaxH3ReferenceToVideo");
+  if (references.length !== 1) return {};
+  const audio = references[0].inputs?.["ref_audios.ref_audio_0"];
+  if (!Array.isArray(audio) || audio.length !== 2 || String(audio[0]) !== sourceId || audio[1] !== 1) return {};
+  return {workflow_prompt:prompt, source_node_id:sourceId};
+}
+
+function linkedMaterialSource(graph, node, projectId) {
+  const inputs = node.inputs?.filter(input => input.name === "material") || [];
+  if (inputs.length !== 1 || inputs[0].link === undefined || inputs[0].link === null || typeof graph?.getNodeById !== "function") return null;
+  const link = graph.links?.get?.(inputs[0].link) || graph.links?.[inputs[0].link];
+  const source = link && graph.getNodeById(link.origin_id);
+  const projectIds = [source?.properties?.h3lv_project, source && widget(source,"project_id")?.value].filter(Boolean);
+  if (!source || (source.comfyClass || source.type) !== "H3LVUnified" || link.origin_slot !== 4 ||
+      !projectIds.length || projectIds.some(id => id !== projectId)) return null;
+  return source;
+}
+
 async function settingsDialog(node) {
-  const {main, status} = dialog("H3 分镜提示词生成器 · API 设置");
+  const {main, status} = dialog("MiniMax H3 · MV Prompt Expander — API 设置");
   const profile = await request("/h3lv/expansion/settings");
   element("p", main, "配置仅保存在本机，不随工作流导出。更换服务后请填写对应密钥。");
   const addressLabel = element("label", main, "API 基础地址");
@@ -94,14 +120,14 @@ function batchApplyBody(plan, job, selected, edits) {
   return {revision:plan.revision, indices, edits:Object.fromEntries(indices.filter(index => edits.has(index)).map(index => [index, edits.get(index)]))};
 }
 async function previewDialog(node) {
-  const view = dialog("H3 分镜提示词生成器 · 分段预览与批量扩写"), {main, status} = view;
-  element("p", main, "先在长视频面板保存素材与导演简报。批次结果先供预览，保存后需重新确认项目。关闭此面板后后台继续；取消只影响当前批次，已发出的 API 请求可能仍产生费用。");
+  const view = dialog("MiniMax H3 · MV Prompt Expander — 分段预览与批量扩写"), {main, status} = view;
+  element("p", main, "先在MV Generator 面板保存素材与导演简报。批次结果先供预览，保存后需重新确认项目。关闭此面板后后台继续；取消只影响当前批次，已发出的 API 请求可能仍产生费用。");
   element("p", main, "单段与批量扩写均按 H3 规则生成中文正文，六个章节名及标签保留原格式。失败结果不会自动应用，成功候选请预览后保存。");
   const projects = element("select", main); projects.setAttribute("aria-label", "分析项目");
   const list = await request("/h3lv/projects");
   for (const p of list) element("option", projects, `${p.mode} · ${p.count}段 · ${p.id.slice(0,8)}`).value = p.id;
-  const link = app.graph.links[node.inputs?.find(input => input.name === "material")?.link];
-  const source = link && app.graph.getNodeById(link.origin_id);
+  const link = app.graph?.links?.[node.inputs?.find(input => input.name === "material")?.link];
+  const source = link && app.graph.getNodeById?.(link.origin_id);
   const current = source && (source.properties?.h3lv_project || widget(source,"project_id")?.value);
   if (list.some(p => p.id === current)) projects.value = current;
   let plan, previewKey, previewOptions, singleDirty = false, alive = true, epoch = 0, singleEpoch = 0, timer;
@@ -130,6 +156,20 @@ async function previewDialog(node) {
   function allowDiscard() {return !unsaved() || window.confirm("提示词还有未保存的编辑。确认放弃这些编辑？后台批次会继续运行。");}
   function stopPolling() {clearTimeout(timer); timer = null;}
   view.onClose(allowDiscard, () => {alive = false; epoch++; stopPolling();});
+  async function workflowContext(pid, revision, token, unchanged = () => true) {
+    const graph = app.graph;
+    const current = () => alive && epoch === token && projects.value === pid && plan?.id === pid &&
+      plan.revision === revision && app.graph === graph && unchanged() &&
+      (typeof graph?.getNodeById !== "function" || graph.getNodeById(node.id) === node);
+    if (!current()) return null;
+    const source = linkedMaterialSource(graph, node, pid);
+    if (!source || typeof app.graphToPrompt !== "function") return {};
+    let snapshot;
+    try {snapshot = await app.graphToPrompt();}
+    catch {return current() && linkedMaterialSource(graph, node, pid) === source ? {} : null;}
+    if (!current() || linkedMaterialSource(graph, node, pid) !== source) return null;
+    return expansionWorkflowContext(snapshot?.output, node.id, pid, source.id);
+  }
   function renderTargets() {
     targets.replaceChildren();
     for (const row of plan.segments) {
@@ -209,10 +249,12 @@ async function previewDialog(node) {
     void poll();
   };
   button(singleActions, "生成提示词（自动复用缓存）", status, async () => {
-    if (!plan?.materials_version) throw new Error("请先在长视频面板启用内置素材管理。");
+    if (!plan?.materials_version) throw new Error("请先在MV Generator 面板启用内置素材管理。");
     if (singleDirty && !window.confirm("放弃未保存的编辑并生成本段候选？")) return;
-    const pid = plan.id, index = Number(segments.value), token = epoch, singleToken = ++singleEpoch, settings = options(node);
-    const result = await request(`/h3lv/project/${pid}/expand`, {revision:plan.revision, index, ...settings});
+    const pid = plan.id, revision = plan.revision, index = Number(segments.value), token = epoch, singleToken = ++singleEpoch, settings = options(node);
+    const context = await workflowContext(pid, revision, token, () => singleToken === singleEpoch && Number(segments.value) === index && JSON.stringify(options(node)) === JSON.stringify(settings));
+    if (context === null) return;
+    const result = await request(`/h3lv/project/${pid}/expand`, {revision, index, ...settings, ...context});
     if (!alive || token !== epoch || singleToken !== singleEpoch || plan.id !== pid || Number(segments.value) !== index) return;
     text.value = result.text; previewKey = result.key; previewOptions = settings; singleDirty = true;
     status.textContent = `来源：${sourceLabels[result.source] || result.source}；可编辑后保存。`;
@@ -220,11 +262,13 @@ async function previewDialog(node) {
   button(singleActions, "保存本段提示词", status, async () => {
     if (!previewKey) throw new Error("请先扩写或读取当前设置的缓存。");
     if (JSON.stringify(options(node)) !== JSON.stringify(previewOptions)) throw new Error("节点设置已变化，请重新扩写。");
-    const pid = plan.id, index = Number(segments.value), token = epoch, submittedText = text.value, singleToken = singleEpoch;
-    const result = await request(`/h3lv/project/${pid}/expand`, {revision:plan.revision, index, ...previewOptions, key:previewKey, text:submittedText});
+    const pid = plan.id, revision = plan.revision, index = Number(segments.value), token = epoch, submittedText = text.value, singleToken = singleEpoch;
+    const context = await workflowContext(pid, revision, token, () => Number(segments.value) === index && JSON.stringify(options(node)) === JSON.stringify(previewOptions));
+    if (context === null) return;
+    const result = await request(`/h3lv/project/${pid}/expand`, {revision, index, ...previewOptions, key:previewKey, text:submittedText, ...context});
     if (!alive || token !== epoch || plan.id !== pid) return;
     plan.revision = result.revision; plan.segments.find(row => row.index === index).expanded_prompt = submittedText; if (singleToken === singleEpoch && text.value === submittedText) singleDirty = false;
-    status.textContent = "已保存。请在长视频面板刷新并确认后生成。";
+    status.textContent = "已保存。请在MV Generator 面板刷新并确认后生成。";
   });
   async function adoptJob(next, token = epoch) {
     if (!alive || token !== epoch || next.project_id !== plan?.id) return;
@@ -236,7 +280,11 @@ async function previewDialog(node) {
     if (!segmentSelection.size) throw new Error("请先选择分段。");
     if (unsaved()) throw new Error("请先保存编辑，或刷新面板并确认放弃编辑。");
     if (force.checked && !window.confirm("为选中分段重新生成已有扩写结果？手写直通提示词始终保留；已保存扩写原文保留，只有明确保存选中结果后才会替换。每段请求可能产生用量。")) return;
-    const pid = plan.id, token = epoch, next = await request(`/h3lv/project/${pid}/expansion-batches`, {revision:plan.revision, indices:[...segmentSelection], force:Boolean(force.checked), concurrency:Number(concurrency.value), ...options(node)});
+    const pid = plan.id, revision = plan.revision, token = epoch, settings = options(node);
+    const body = {revision, indices:[...segmentSelection], force:Boolean(force.checked), concurrency:Number(concurrency.value), ...settings};
+    const context = await workflowContext(pid, revision, token, () => !unsaved() && JSON.stringify(options(node)) === JSON.stringify(settings));
+    if (context === null) return;
+    const next = await request(`/h3lv/project/${pid}/expansion-batches`, {...body, ...context});
     await adoptJob(next, token);
   });
   button(resultActions, "刷新项目并重新校验", status, async () => {
@@ -260,22 +308,26 @@ async function previewDialog(node) {
     const indices = job.items.filter(item => onlyFailed ? item.status === "failed" && selected.has(item.index) : ["pending", "running", "failed", "cancelled", "interrupted", "conflict"].includes(item.status)).map(item => item.index);
     if (!indices.length) throw new Error(onlyFailed ? "请勾选失败段。" : "没有需要续跑的分段。");
     if (!window.confirm("超时或中断的请求可能已被服务处理。确认创建新批次重试这些分段？")) return;
-    const token = epoch;
-    await adoptJob(await request(`/h3lv/project/${plan.id}/expansion-batches/${job.id}/retry`, {revision:plan.revision, indices, concurrency:Number(concurrency.value)}), token);
+    const pid = plan.id, revision = plan.revision, jid = job.id, token = epoch, body = {revision, indices, concurrency:Number(concurrency.value)};
+    const context = await workflowContext(pid, revision, token, () => !unsaved() && job?.id === jid && selectedJobId === jid);
+    if (context === null) return;
+    await adoptJob(await request(`/h3lv/project/${pid}/expansion-batches/${jid}/retry`, {...body, ...context}), token);
   }
   button(resultActions, "续跑未完成段", status, () => retry(false));
   button(resultActions, "仅重试选中失败段", status, () => retry(true));
   button(resultActions, "保存选中成功结果", status, async () => {
     if (!job) throw new Error("请先选择批次。");
     if (singleDirty) throw new Error("请先保存本段编辑。");
-    const pid = plan.id, jid = job.id, token = epoch;
-    const body = {...options(node), ...batchApplyBody(plan, job, selected, edits)};
-    const result = await request(`/h3lv/project/${pid}/expansion-batches/${jid}/apply`, body);
+    const pid = plan.id, revision = plan.revision, jid = job.id, token = epoch, settings = options(node);
+    const body = {...settings, ...batchApplyBody(plan, job, selected, edits)};
+    const context = await workflowContext(pid, revision, token, () => !singleDirty && job?.id === jid && selectedJobId === jid && JSON.stringify(options(node)) === JSON.stringify(settings));
+    if (context === null) return;
+    const result = await request(`/h3lv/project/${pid}/expansion-batches/${jid}/apply`, {...body, ...context});
     if (!alive || epoch !== token || plan.id !== pid || selectedJobId !== jid) return;
     const next = result.plan || await request(`/h3lv/project/${pid}`);
     if (!alive || epoch !== token || plan.id !== pid) return;
     plan = next; for (const [index, submitted] of Object.entries(body.edits)) {if (edits.get(Number(index)) === submitted) edits.delete(Number(index));}
-    if (!singleDirty) updateSingle(); renderTargets(); status.textContent = `已一次保存 ${result.changed.length} 段变更。请在长视频面板刷新并确认后生成。`;
+    if (!singleDirty) updateSingle(); renderTargets(); status.textContent = `已一次保存 ${result.changed.length} 段变更。请在MV Generator 面板刷新并确认后生成。`;
   });
   await load();
 }

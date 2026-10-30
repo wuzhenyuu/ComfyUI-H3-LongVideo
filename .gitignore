@@ -19,3 +19,4 @@ models/
 *.pt
 *.pth
 *.onnx
+runninghub_api.json

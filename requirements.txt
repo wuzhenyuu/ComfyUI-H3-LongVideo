@@ -6,3 +6,5 @@ scipy>=1.12.0
 einops>=0.8.0
 safetensors>=0.4.0
 lm-format-enforcer==0.11.3
+requests>=2.31
+mediapipe>=0.10.31,<0.11

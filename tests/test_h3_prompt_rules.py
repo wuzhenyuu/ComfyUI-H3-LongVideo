@@ -62,7 +62,7 @@ class H3PromptRulesTests(unittest.TestCase):
                      fixtures.TEXT.replace(fixtures.STYLE+'\n', ''),
                      fixtures.TEXT+'\n\nsummary:\n[reference generation] 重复章节。'):
             with self.subTest(text=text[:70]), self.assertRaises(ValueError):
-                expansion.validate_prompt(text, 1)
+                rules.validate_segment_prompt(text, 1)
 
     def test_english_descriptions_fail_even_with_valid_fixed_tokens(self):
         text = fixtures.TEXT.replace(fixtures.SUMMARY, '[reference generation] One continuous shot.')
@@ -75,7 +75,7 @@ class H3PromptRulesTests(unittest.TestCase):
                  'For the target video, at 0.00 seconds into the target video.\n\n'+fixtures.TEXT]
         for text in cases:
             with self.subTest(text=text[:70]), self.assertRaises(ValueError):
-                expansion.validate_prompt(text, 1)
+                rules.validate_segment_prompt(text, 1)
 
     def test_n_a_sound_fields_cannot_be_replaced_by_new_audio(self):
         for field in ('overall_soundscape', 'non_diegetic_music'):

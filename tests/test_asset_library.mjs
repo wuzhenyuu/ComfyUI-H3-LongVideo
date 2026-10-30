@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
+import {shotRequestText} from "../web/shot_request.js";
 
 const plain = value => JSON.parse(JSON.stringify(value));
 function harness() {
@@ -12,7 +13,7 @@ function harness() {
       remove() {this.isConnected = false;}, replaceChildren() {this.children = [];}};
     elements.push(item); return item;
   }};
-  const context = {document, URLSearchParams, FormData, window:{confirm:() => true, alert() {}},
+  const context = {document, URLSearchParams, FormData, shotRequestText, window:{confirm:() => true, alert() {}},
     withUiLogging: action => action, api:{apiURL:path => path}};
   const mentions = fs.readFileSync(new URL("../web/material_mentions.js", import.meta.url), "utf8").replaceAll("export ", "");
   const source = fs.readFileSync(new URL("../web/asset_library.js", import.meta.url), "utf8").replace(/^import .*;\r?\n/gm, "").replaceAll("export ", "");
@@ -84,4 +85,22 @@ test("inherited material editor stays read only and only custom imports mark dra
   await opened.onImport({refs:["scene.png"],origins:{"scene.png":{name_at_import:"舞台"}}},{mode:"append",noteMode:"append"});
   assert.deepEqual(plain(editor.refs),["scene.png"]); assert.equal(editor.getNote(),"@图1：舞台");
   assert.equal(changed,2);
+});
+
+test("library import preserves the unified shot request and saves new image descriptions in that request", async () => {
+  const h = harness(); let changed = 0;
+  const source = fs.readFileSync(new URL("../web/materials.js",import.meta.url),"utf8").replace(/^import .*;\r?\n/gm,"").replaceAll("export ","");
+  vm.runInContext(source+"\nglobalThis.makeEditor = materialEditor;",h.context);
+  vm.runInContext("openAssetLibrary = async value => {globalThis.opened = value;};",h.context);
+  const editor = h.context.makeEditor(h.context.document.createElement("div"),{projectId:"p",refs:["person.png"],
+    note:"旧素材说明",unified:true,shotRequest:"@图1 是主角，镜头缓慢跟随",getRevision:() => 9,changed:() => changed++});
+  await h.elements.find(item => item.textContent === "从素材库选择").onclick();
+  await h.context.opened.onImport({refs:["scene.png"],origins:{"scene.png":{name_at_import:"舞台"}}},{mode:"append",noteMode:"append"});
+  assert.deepEqual(plain(editor.refs),["person.png","scene.png"]);
+  assert.equal(editor.getRequest(),"@图1 是主角，镜头缓慢跟随\n@图2：舞台");
+  assert.equal(editor.note.value,editor.getRequest());
+  assert.equal(changed,1);
+  await assert.rejects(h.context.opened.onImport({refs:["other.png"]},{mode:"replace",noteMode:"keep"}),/仍引用/);
+  assert.deepEqual(plain(editor.refs),["person.png","scene.png"]);
+  assert.equal(changed,1);
 });

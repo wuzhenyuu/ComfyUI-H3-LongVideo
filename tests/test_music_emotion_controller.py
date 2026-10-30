@@ -25,7 +25,7 @@ class EmotionControllerGateTests(unittest.TestCase):
 
     def test_idle_start_continues_to_existing_plan_validation(self):
         with patch.object(emotion, 'require_inactive') as guard, \
-                patch.object(controller, 'read_plan', return_value={'approved': False}):
+                patch.object(controller, 'read_plan', return_value={'approved': False, 'mode': 'singing', 'segments': []}):
             with self.assertRaisesRegex(ValueError, '保存并确认'):
                 controller.start('unused', 'b' * 32, {}, None)
         guard.assert_called_once_with()

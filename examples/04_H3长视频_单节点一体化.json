@@ -158,8 +158,8 @@
         "Node name for S&R": "VAELoader",
         "models": [
           {
-            "name": "minimax_h3_video_vae_fp16.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_fp16.safetensors",
+            "name": "minimax_h3_video_vae_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/vae/minimax_h3_video_vae_int8_convrot.safetensors",
             "directory": "vae"
           }
         ],
@@ -239,8 +239,8 @@
         "Node name for S&R": "CLIPLoader",
         "models": [
           {
-            "name": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
-            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+            "name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+            "url": "https://huggingface.co/Comfy-Org/MiniMax-H3/resolve/main/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
             "directory": "text_encoders"
           }
         ],
@@ -379,8 +379,7 @@
         }
       ],
       "properties": {
-        "cnr_id": "comfyui-kjnodes",
-        "ver": "3f20054214fec9f9234fd3841ae6f1e4287948f6",
+        "cnr_id": "comfy-core",
         "Node name for S&R": "ModelAttentionBackend",
         "ue_properties": {
           "widget_ue_connectable": {},
@@ -649,7 +648,7 @@
       "widgets_values": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "video/MiniMax_H3",
+        "filename_prefix": "H3LongVideo/MV/video",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -661,7 +660,7 @@
       "widgets_values_named": {
         "frame_rate": 24,
         "loop_count": 0,
-        "filename_prefix": "video/MiniMax_H3",
+        "filename_prefix": "H3LongVideo/MV/video",
         "format": "video/h264-mp4",
         "pix_fmt": "yuv420p",
         "crf": 19,
@@ -1340,7 +1339,7 @@
           ]
         }
       ],
-      "title": "H3 长视频 · 分镜提示词生成器",
+      "title": "MiniMax H3 · MV Prompt Expander",
       "properties": {
         "Node name for S&R": "H3LVPromptExpand"
       },
@@ -2055,7 +2054,8 @@
         "director_mode": "本地规则",
         "project_id": "",
         "segment_index": 0
-      }
+      },
+      "title": "MiniMax H3 · MV Generator"
     },
     {
       "id": 253,

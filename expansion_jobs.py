@@ -15,6 +15,7 @@ _DEFAULTS = dict(mode='vision', model='qwen/qwen3.8-flash', rule='', revision=0,
 _MATERIAL_FIELDS = frozenset((
     'paths', 'hashes', 'refs', 'project_id', 'segment_index', 'material_note', 'visual_type', 'mode', 'brief', 'duration',
     'generation_frames', 'generation_seconds', 'audio_role', 'audio_section',
+    'contract_version', 'brief_source', 'shot_intent', 'music_emotion', 'user_director_brief',
     'audio_role_reason', 'audio_reference_available', 'audio_reference_slot',
     'video_refs', 'video_note', 'video_reference_source', 'video_paths', 'video_hashes', 'video_durations',
     'cache_dir', 'expanded_prompt', 'expanded_key'))

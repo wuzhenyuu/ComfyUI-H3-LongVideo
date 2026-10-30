@@ -33,10 +33,137 @@ function fixture(overrides = {}) {
       return {ok:true,json:async () => result};
     }}};
   const source = fs.readFileSync(new URL("../web/expansion.js",import.meta.url),"utf8").replace(/^import .*;\r?\n/gm,"");
-  vm.createContext(context); vm.runInContext(source+"\nglobalThis.testing = {previewDialog,batchApplyBody};",context);
+  vm.createContext(context); vm.runInContext(source+"\nglobalThis.testing = {previewDialog,batchApplyBody,expansionWorkflowContext};",context);
   const node = {widgets:Object.entries({mode:"vision",model:"api-model",rule:"rule",revision:1,provider:"codex_cli",codex_model:"fixture",codex_reasoning:"high"}).map(([name,value]) => ({name,value}))};
   return {elements,calls,timers,context,plan,job,node,find:text => elements.find(item => item.textContent === text)};
 }
+
+function workflow(h) {
+  h.node.id = 2; h.node.comfyClass = "H3LVPromptExpand"; h.node.inputs = [{name:"material",link:20}];
+  const loader = {id:1,comfyClass:"H3LVUnified",properties:{h3lv_project:"p"},widgets:[{name:"project_id",value:"p"}]};
+  const graph = {links:{20:{origin_id:1,origin_slot:4}},getNodeById(id) {return {1:loader,2:h.node}[id];}};
+  const output = {
+    1:{class_type:"H3LVUnified",inputs:{project_id:"p"}},
+    2:{class_type:"H3LVPromptExpand",inputs:{material:["1",4]}},
+    3:{class_type:"MiniMaxH3ReferenceToVideo",inputs:{"ref_audios.ref_audio_0":["1",1]}},
+  };
+  h.context.app.graph = graph;
+  h.context.app.graphToPrompt = async function() {assert.equal(this,h.context.app); return {output};};
+  return {loader,graph,output};
+}
+
+test("workflow evidence requires the current MV material and project plus audio slot zero from loader output one", () => {
+  const h = fixture(), {output} = workflow(h), evidence = h.context.testing.expansionWorkflowContext;
+  assert.deepEqual(plain(evidence(output,2,"p",1)),{workflow_prompt:output,source_node_id:"1"});
+  const invalid = [
+    prompt => {prompt[3].inputs["ref_audios.ref_audio_0"] = ["1",0];},
+    prompt => {prompt[3].inputs["ref_audios.ref_audio_0"] = ["1","1"];},
+    prompt => {prompt[3].inputs = {"ref_audios.ref_audio_1":["1",1]};},
+    prompt => {prompt[3].inputs["ref_audios.ref_audio_0"] = ["other",1];},
+    prompt => {delete prompt[3];},
+    prompt => {prompt[4] = structuredClone(prompt[3]);},
+    prompt => {prompt[1].inputs.project_id = "q";},
+    prompt => {prompt[1].class_type = "H3LVTalkingAvatar";},
+    prompt => {prompt[2].inputs.material = ["1",0];},
+    prompt => {prompt[2].class_type = "Unrelated";},
+  ];
+  for (const mutate of invalid) {
+    const prompt = structuredClone(output); mutate(prompt);
+    assert.deepEqual(plain(evidence(prompt,2,"p",1)),{});
+  }
+  for (const prompt of [null,undefined,[],{}]) assert.deepEqual(plain(evidence(prompt,2,"p",1)),{});
+  assert.deepEqual(plain(evidence(output,2,"p","other")),{});
+});
+
+test("single preview and save both send temporary graph evidence through the app host", async () => {
+  const h = fixture({fetch:async (path,body) => path.endsWith("/expand") ?
+    (Object.hasOwn(body,"text") ? {revision:4} : {text:"候选",key:"verified-key",source:"api"}) : undefined});
+  const {output} = workflow(h);
+  await h.context.testing.previewDialog(h.node);
+  await h.find("生成提示词（自动复用缓存）").onclick();
+  await h.find("保存本段提示词").onclick();
+  const requests = h.calls.filter(item => item.path.endsWith("/expand"));
+  assert.equal(requests.length,2);
+  for (const item of requests) {
+    assert.deepEqual(item.body.workflow_prompt,output); assert.equal(item.body.source_node_id,"1");
+    assert.equal(Object.hasOwn(item.body,"audio_reference_available"),false);
+    assert.equal(item.body.provider,"codex_cli");
+  }
+  assert.equal(requests[1].body.key,"verified-key"); assert.equal(requests[1].body.text,"候选");
+});
+
+test("batch start and apply send graph evidence without storing it in frozen generation options", async () => {
+  const h = fixture(), {output} = workflow(h);
+  await h.context.testing.previewDialog(h.node);
+  await h.find("启动批量扩写").onclick();
+  await h.find("保存选中成功结果").onclick();
+  const start = h.calls.find(item => item.body && item.path.endsWith("/expansion-batches"));
+  const apply = h.calls.find(item => item.path.endsWith("/apply"));
+  assert.ok(start); assert.ok(apply);
+  for (const item of [start,apply]) {
+    assert.deepEqual(item.body.workflow_prompt,output); assert.equal(item.body.source_node_id,"1");
+    assert.equal(item.body.provider,"codex_cli");
+  }
+  assert.deepEqual(h.job.settings,{provider:"codex_cli"});
+});
+
+test("retry uses the current verified graph while keeping the previous batch provider frozen", async () => {
+  const h = fixture(), {output} = workflow(h);
+  h.job.items = [{index:0,status:"failed",error:"request failed"}];
+  await h.context.testing.previewDialog(h.node);
+  await h.find("启动批量扩写").onclick();
+  h.node.widgets.find(item => item.name === "provider").value = "api";
+  await h.find("续跑未完成段").onclick();
+  const retry = h.calls.find(item => item.path.endsWith("/retry"));
+  assert.ok(retry); assert.deepEqual(retry.body.workflow_prompt,output); assert.equal(retry.body.source_node_id,"1");
+  assert.equal(Object.hasOwn(retry.body,"provider"),false); assert.deepEqual(retry.body.indices,[0]);
+});
+
+test("legacy hosts, unavailable graph conversion and another project keep unverified audio behavior", async () => {
+  for (const mode of ["missing","failed","other-project","ambiguous-audio"]) {
+    const h = fixture(); const {loader,output} = workflow(h);
+    if (mode === "missing") delete h.context.app.graphToPrompt;
+    if (mode === "failed") h.context.app.graphToPrompt = async () => {throw new Error("snapshot unavailable");};
+    if (mode === "other-project") loader.properties.h3lv_project = "q";
+    if (mode === "ambiguous-audio") output[3].inputs = {};
+    await h.context.testing.previewDialog(h.node);
+    await h.find("启动批量扩写").onclick();
+    const request = h.calls.find(item => item.body && item.path.endsWith("/expansion-batches"));
+    assert.ok(request,mode); assert.equal(Object.hasOwn(request.body,"workflow_prompt"),false,mode);
+    assert.equal(Object.hasOwn(request.body,"source_node_id"),false,mode);
+  }
+});
+
+test("project, revision, node, source link, canvas and settings changes during graph capture prevent submission", async () => {
+  for (const mode of ["project","revision","node","source","source-project","canvas","settings","closed"]) {
+    const h = fixture(), {loader,graph,output} = workflow(h); let resolveGraph;
+    h.context.app.graphToPrompt = () => new Promise(resolve => {resolveGraph=resolve;});
+    await h.context.testing.previewDialog(h.node);
+    const pending = h.find("启动批量扩写").onclick(); await flush();
+    if (mode === "project") {
+      const projects = h.elements.find(item => item["aria-label"] === "分析项目"); projects.value="q"; projects.onchange(); await flush();
+    }
+    if (mode === "revision") {h.plan.revision += 1; await h.find("刷新项目并重新校验").onclick();}
+    if (mode === "node") graph.getNodeById = () => null;
+    if (mode === "source") graph.links[20].origin_id = 9;
+    if (mode === "source-project") loader.properties.h3lv_project = "q";
+    if (mode === "canvas") h.context.app.graph = {...graph};
+    if (mode === "settings") h.node.widgets.find(item => item.name === "provider").value="api";
+    if (mode === "closed") h.find("关闭").onclick();
+    resolveGraph({output}); await pending;
+    assert.equal(h.calls.some(item => item.body && item.path.endsWith("/expansion-batches")),false,mode);
+  }
+});
+
+test("changing the single segment while its graph is captured does not submit a late preview", async () => {
+  const h = fixture(), {output} = workflow(h); let resolveGraph;
+  h.context.app.graphToPrompt = () => new Promise(resolve => {resolveGraph=resolve;});
+  await h.context.testing.previewDialog(h.node);
+  const pending = h.find("生成提示词（自动复用缓存）").onclick(); await flush();
+  const segments = h.elements.find(item => item["aria-label"] === "单段预览"); segments.value="1"; segments.onchange();
+  resolveGraph({output}); await pending;
+  assert.equal(h.calls.some(item => item.path.endsWith("/expand")),false);
+});
 
 test("batch apply filters successful selection and sends edits together under one revision", () => {
   const h = fixture();

@@ -13,6 +13,9 @@ from unittest.mock import patch
 from PIL import Image
 import test_materials as fixtures
 
+from test_expansion_fixtures import chinese_prompt
+TEXT = chinese_prompt()
+
 expansion = fixtures.expansion
 rules = expansion.h3_prompt_rules
 cli = importlib.import_module('h3lv_test.codex_cli')
@@ -22,7 +25,7 @@ CLI_PROFILE = {'cli_identity': {'backend': 'local-fixture', 'model': '', 'reason
 
 
 def video_prompt(count=1):
-    text = fixtures.TEXT
+    text = TEXT
     definitions = ''.join(f'\n<Video {i}> 是缓慢前推运镜与镜头渐缓节奏的视觉参考，仅用于本段可用帧。' for i in range(1, count+1))
     retention = ''.join(f'\n<Video {i}>：weak_reference - 仅参考可用视觉样本的运镜方向与节奏。' for i in range(1, count+1))
     text = text.replace('\n\nsummary:', definitions+'\n\nsummary:')
@@ -64,7 +67,7 @@ class VideoExpansionTests(unittest.TestCase):
     def test_real_video_slots_allow_motion_and_require_every_selected_source(self):
         text = video_prompt(2)
         self.assertEqual(expansion.validate_prompt(text, 2, self.packet), text)
-        for invalid in (fixtures.TEXT, video_prompt(), text.replace('<Video 2>', '<Video 4>'),
+        for invalid in (TEXT, video_prompt(), text.replace('<Video 2>', '<Video 4>'),
                         text.replace('<Video 1>', '<Video 0>')):
             with self.subTest(invalid=invalid[:100]), self.assertRaises(ValueError):
                 expansion.validate_prompt(invalid, 2, self.packet)
@@ -73,7 +76,7 @@ class VideoExpansionTests(unittest.TestCase):
 
     def test_action_provenance_uses_subject_and_camera_source_requires_retention(self):
         packet = self.one_video()
-        action = fixtures.TEXT.replace('场景、光影与构图参考。', '人物身份与服装参考，手臂动作借用 <Video 1>。')
+        action = TEXT.replace('场景、光影与构图参考。', '人物身份与服装参考，手臂动作借用 <Video 1>。')
         expansion.validate_prompt(action, 2, packet)
         with self.assertRaisesRegex(ValueError, '动作'):
             expansion.validate_prompt(action.replace('手臂动作', '人物身份'), 2, packet)
@@ -250,30 +253,31 @@ class VideoExpansionTests(unittest.TestCase):
             'duration', 'generation_frames', 'generation_seconds', 'audio_role', 'audio_section', 'audio_role_reason')}
         context.update(material_note=expansion.model_material_note(packet['material_note'], 2),
             audio_reference_available=False, audio_reference_slot=None)
-        expected = hashlib.sha256(json.dumps([context, 'text', 'fixture', '规则', 0, PROFILE['base_url'], expansion.GUARD], sort_keys=True).encode()).hexdigest()
+        context.update(expansion.intent_context(packet))
+        expected = hashlib.sha256(json.dumps([context, 'text', 'fixture', '规则', 0, PROFILE['base_url'], expansion.GUARD+'\n'+expansion.INTENT_RULE], sort_keys=True).encode()).hexdigest()
         self.assertEqual(key, expected)
         empty = dict(video_refs=[], video_paths=[], video_hashes=[], video_durations=[], video_note='', video_reference_source='default')
         self.assertEqual(key, expansion.cache_key({**packet, **empty}, 'text', 'fixture', '规则', 0, profile=PROFILE))
         cache = Path(packet['cache_dir'])
         cache.mkdir()
-        (cache/(key+'.json')).write_text(json.dumps({'text': fixtures.TEXT}), encoding='utf-8')
+        (cache/(key+'.json')).write_text(json.dumps({'text': TEXT}), encoding='utf-8')
         with patch.object(expansion, 'call', side_effect=AssertionError('Legacy cache not used')):
-            self.assertEqual(self.expand(packet, mode='text'), fixtures.TEXT)
+            self.assertEqual(self.expand(packet, mode='text'), TEXT)
 
     def test_video_invalid_saved_cache_and_new_output_are_all_validated(self):
         packet = self.one_video()
         key = expansion.cache_key(packet, 'text', 'fixture', '规则', 0, profile=PROFILE)
         cache = Path(packet['cache_dir'])
         cache.mkdir()
-        (cache/(key+'.json')).write_text(json.dumps({'text': fixtures.TEXT}), encoding='utf-8')
-        packet.update(expanded_prompt=fixtures.TEXT, expanded_key=key)
+        (cache/(key+'.json')).write_text(json.dumps({'text': TEXT}), encoding='utf-8')
+        packet.update(expanded_prompt=TEXT, expanded_key=key)
         self.assertEqual(expansion.cache_source(packet, key, 'text'), 'api')
         with patch.object(expansion, 'call', return_value={'choices': [{'message': {'content': video_prompt()}}]}) as provider:
             self.assertEqual(self.expand(packet, mode='text'), video_prompt())
         provider.assert_called_once()
         self.assertEqual(json.loads((cache/(key+'.json')).read_text(encoding='utf-8'))['text'], video_prompt())
         other = {**packet, 'video_hashes': ['changed'], 'expanded_key': ''}
-        with patch.object(expansion, 'call', return_value={'choices': [{'message': {'content': fixtures.TEXT}}]}) as provider:
+        with patch.object(expansion, 'call', return_value={'choices': [{'message': {'content': TEXT}}]}) as provider:
             with self.assertRaises(ValueError):
                 self.expand(other, mode='text')
         provider.assert_called_once()

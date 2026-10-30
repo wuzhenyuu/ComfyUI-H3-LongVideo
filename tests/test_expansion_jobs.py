@@ -487,6 +487,46 @@ class ExpansionJobsTests(unittest.TestCase):
         self.assertTrue(final['items'][0]['material']['audio_reference_available'])
         self.assertEqual(final['items'][0]['material']['audio_reference_slot'], 1)
 
+    def test_modern_intent_and_music_analysis_snapshot_keep_apply_cache_identity(self):
+        analysis = {'labels': ['平静'], 'intensity': 2,
+                    **{name: '已核实来源的音乐表达估计' for name in
+                       ('trend', 'summary', 'melody', 'rhythm', 'timbre', 'vocal', 'lyrics', 'uncertainty')}}
+        packet = self.packet(0, contract_version=3, brief_source='none',
+            shot_intent='人物向左走，镜头跟随。', music_emotion=analysis,
+            user_director_brief='人工导演条件：表演克制，音乐情绪是期待。')
+        packet['brief'] = ''
+        original = copy.deepcopy(packet)
+        expected_key = expansion.cache_key(original, **SETTINGS, profile=PROFILE)
+        entered, release = self.event(), self.event()
+        requests = []
+        def provider(path, payload, **kwargs):
+            requests.append(json.loads(payload['messages'][1]['content'][0]['text']))
+            entered.set()
+            release.wait(3)
+            return ANSWER
+        with patch.object(expansion, 'call', side_effect=provider):
+            job = self.start([dict(index=0, material=packet)], concurrency=1)
+            self.assertTrue(entered.wait(2))
+            packet['contract_version'] = 99
+            packet['brief_source'] = 'changed'
+            packet['shot_intent'] = 'caller mutation'
+            packet['user_director_brief'] = 'caller mutation'
+            packet['music_emotion']['labels'].append('caller mutation')
+            release.set()
+            final = self.wait(job)
+        self.assertEqual(final['counts'], {'succeeded': 1})
+        saved = final['items'][0]
+        for field in ('contract_version', 'brief_source', 'shot_intent', 'music_emotion', 'user_director_brief'):
+            self.assertEqual(saved['material'][field], original[field])
+            self.assertEqual(requests[0][field], original[field])
+        self.assertEqual(saved['key'], expected_key)
+        self.assertEqual(saved['key'], expansion.cache_key(original, **final['settings'], profile=PROFILE))
+        self.assertEqual(requests[0]['brief'], '')
+        changed_brief = {**original, 'user_director_brief': '另一段人工导演条件。'}
+        self.assertNotEqual(saved['key'], expansion.cache_key(changed_brief, **final['settings'], profile=PROFILE))
+        original['music_emotion']['intensity'] = 4
+        self.assertNotEqual(saved['key'], expansion.cache_key(original, **final['settings'], profile=PROFILE))
+
 
 if __name__ == '__main__':
     unittest.main()

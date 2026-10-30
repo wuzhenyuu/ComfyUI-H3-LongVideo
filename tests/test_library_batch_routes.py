@@ -65,6 +65,7 @@ class LibraryBatchRouteTests(unittest.IsolatedAsyncioTestCase):
         core.decorate(self.plan)
         for i, row in enumerate(self.plan['segments']):
             row['prompt'] += f'\nFixture segment {i}.'
+            row['shot_request'] = f'@图1 为角色参考，本段独立拍摄要求 {i}。'
         core.write_plan(self.root, self.plan)
         self.base = f"/h3lv/project/{self.plan['id']}"
         self.payload = dict(revision=1, indices=list(range(10)), mode='vision', model='fixture-model',
@@ -224,6 +225,39 @@ class LibraryBatchRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan['segments'][1]['final_prompt'], 'Handwritten passthrough must stay')
         self.assertEqual('旧的人工扩写内容。', plan['segments'][0]['expanded_history'][0]['text'])
 
+    async def test_historical_english_cache_can_apply_but_new_english_edits_are_rejected(self):
+        from test_expansion_fixtures import REMOTE_TEXT
+        legacy = REMOTE_TEXT.replace('<Audio 1> is singing.', '').replace('follows <Audio 1>', 'shows the scene')
+        selected = routes.batch_settings(self.payload)
+        material = routes.batch_items(self.plan, self.project, [0])[0]['material']
+        key = expansion.cache_key(material, **selected, profile=routes.expansion_profile(selected))
+        cache = Path(material['cache_dir'])
+        cache.mkdir(parents=True)
+        (cache/(key+'.json')).write_text(json.dumps({'text': legacy}), encoding='utf-8')
+        with patch.object(expansion, 'call', side_effect=AssertionError('Historical cache must not call a provider')):
+            job = await self.start({**self.payload, 'indices': [0]})
+            result = await self.wait_job(job['id'])
+        self.assertEqual(result['items'][0]['status'], 'cached')
+        self.assertEqual(result['items'][0]['source'], 'cache')
+        response = await self.client.post(self.base+'/expansion-batches/'+job['id']+'/apply',
+            json={'revision': 1, 'indices': [0]})
+        self.assertEqual(response.status, 200, await response.text())
+        saved = core.read_plan(self.root, self.plan['id'])
+        expected = expansion.validate_result(legacy, material)
+        self.assertEqual(saved['segments'][0]['expanded_prompt'], expected)
+        edited = await self.client.post(self.base+'/expansion-batches/'+job['id']+'/apply',
+            json={'revision': 2, 'indices': [0], 'edits': {'0': legacy}})
+        self.assertEqual(edited.status, 400, await edited.text())
+        new_candidate = copy.deepcopy(result)
+        new_candidate['items'][0].update(status='succeeded', source='api')
+        with patch.object(jobs, 'get', return_value=new_candidate):
+            response = await self.client.post(self.base+'/expansion-batches/'+job['id']+'/apply',
+                json={'revision': 2, 'indices': [0]})
+        self.assertEqual(response.status, 400, await response.text())
+        current = core.read_plan(self.root, self.plan['id'])
+        self.assertEqual(current['revision'], 2)
+        self.assertEqual(current['segments'][0]['expanded_prompt'], expected)
+
     async def test_h3_invalid_edit_rejects_batch_and_single_save_without_changes(self):
         with patch.object(expansion, 'call', return_value={'choices':[{'message':{'content':fixtures.TEXT}}]}):
             job = await self.start({**self.payload, 'indices': [0, 1]})
@@ -247,7 +281,7 @@ class LibraryBatchRouteTests(unittest.IsolatedAsyncioTestCase):
             job = await self.start({**self.payload, 'indices': [0, 1]})
             await self.wait_job(job['id'])
         plan = core.read_plan(self.root, self.plan['id'])
-        plan['revision'] += 1; plan['segments'][0]['prompt'] += '\nChanged brief'
+        plan['revision'] += 1; plan['segments'][0]['shot_request'] += '镜头向左移动。'
         core.write_plan(self.root, plan)
         for revision in (1, 2):
             response = await self.client.post(self.base+'/expansion-batches/'+job['id']+'/apply',
