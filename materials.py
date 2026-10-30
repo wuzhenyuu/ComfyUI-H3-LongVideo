@@ -4,6 +4,13 @@ import json
 from pathlib import Path
 
 
+def videos_enabled(plan):
+    return (plan.get('video_materials_version') == 1
+            or any(key in plan for key in ('default_video_refs', 'default_video_note'))
+            or any(any(key in row for key in ('video_refs', 'video_note', 'video_reference_source'))
+                   for row in plan.get('segments', [])))
+
+
 def effective(plan, row, directory=None, require=False):
     from .core import normalize_reference_names
     source = row.get('reference_source', 'custom' if row.get('refs') else 'default')
@@ -24,7 +31,11 @@ def packet(plan, row, directory):
     from .core import reference_directory, inside
     value = effective(plan, row, directory, require=True)
     paths = [inside(reference_directory(directory), reference_directory(directory)/name) for name in value['refs']]
-    return {**value, 'project_id': plan['id'], 'segment_index': row['index'],
+    videos = {}
+    if videos_enabled(plan):
+        from .video_materials import packet as video_packet
+        videos = video_packet(plan, row, directory)
+    return {**value, **videos, 'project_id': plan['id'], 'segment_index': row['index'],
             'mode': plan['mode'], 'brief': row['prompt'], 'duration': row['duration'],
             'generation_frames': row['generation_frames'],
             'generation_seconds': row['generation_frames']/24,
@@ -50,4 +61,10 @@ def images(material):
 
 
 def stamp(plan, row):
-    return hashlib.sha256(json.dumps(effective(plan, row), sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    value = effective(plan, row)
+    if videos_enabled(plan):
+        from .video_materials import effective as effective_videos
+        videos = effective_videos(plan, row)
+        if videos['refs'] or videos['note'] or videos['source'] == 'custom':
+            value['videos'] = videos
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()

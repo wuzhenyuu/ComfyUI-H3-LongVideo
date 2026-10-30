@@ -1181,8 +1181,12 @@ def preview_segment_brief(plan, index, visual_type):
     row = copy.deepcopy(rows[index])
     row.update(state)
     row["visual_type"] = visual_type
-    return segment_brief(plan, row, state["camera_start"], state["camera_end"],
+    text = segment_brief(plan, row, state["camera_start"], state["camera_end"],
                          state["camera_move"], state["previous_end_framing"])
+    if row.get('music_emotion', {}).get('status') == 'ready':
+        from .music_emotion import annotate_brief
+        text = annotate_brief(text, row['music_emotion']['analysis'])
+    return text
 
 
 def brief_text(row):
@@ -1362,6 +1366,8 @@ def validate_h3_prompt(value, manifest=None):
 
 
 def decorate(plan, regenerate_prompts=True):
+    from .music_emotion import annotate_brief, invalidate_changed
+    invalidate_changed(plan)
     sr, rows = plan["sample_rate"], plan["segments"]
     if not rows or rows[0]["start_sample"] != 0 or rows[-1]["end_sample"] != plan["samples"]:
         raise ValueError("分段必须覆盖完整原曲。")
@@ -1400,6 +1406,8 @@ def decorate(plan, regenerate_prompts=True):
             framing, ending, move = state["camera_start"], state["camera_end"], state["camera_move"]
             row["camera"] = f"{framing}; {move}"
             row["prompt"] = segment_brief(plan, row, framing, ending, move, state["previous_end_framing"])
+            if row.get('music_emotion', {}).get('status') == 'ready':
+                row['prompt'] = annotate_brief(row['prompt'], row['music_emotion']['analysis'])
         row.pop("h3_prompt", None)
         row.pop("h3_prompt_mode", None)
         row.pop('environment_brief', None)
@@ -1451,16 +1459,90 @@ def request_regeneration(row, reason):
     row.pop("regeneration_reason", None)
 
 
+def apply_expansion_results(plan, candidates):
+    """Apply validated candidates as one revision, retaining prior edited text/takes."""
+    updated = copy.deepcopy(plan)
+    changed, seen = [], set()
+    for candidate in candidates:
+        index = candidate['index']
+        if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(updated['segments']) or index in seen:
+            raise ValueError('批量保存的分段编号无效或重复。')
+        seen.add(index)
+        row = updated['segments'][index]
+        text = candidate['text']
+        if row.get('final_prompt'):
+            raise ValueError('本段已有手写直通提示词，请先在审核面板处理后再应用扩写结果。')
+        if row.get('expanded_prompt', '') == text:
+            continue
+        if row.get('expanded_prompt'):
+            row.setdefault('expanded_history', []).append({
+                'text': row['expanded_prompt'], 'key': row.get('expanded_key'),
+                'source': row.get('expanded_source', 'legacy'), 'batch_id': candidate.get('batch_id')})
+        row.update(expanded_prompt=text, expanded_key=candidate['key'],
+                   expanded_source='edited' if candidate.get('edited') else 'generated',
+                   expanded_generated_hash=hashlib.sha256(candidate.get('generated_text', text).encode('utf-8')).hexdigest())
+        request_regeneration(row, '批量扩写提示词已修改')
+        changed.append(index)
+    if changed:
+        updated.update(revision=updated.get('revision', 0)+1, approved=False,
+                       run_status='draft', changed_segments=changed)
+        if updated.get('final_video'):
+            updated['final_stale'] = True
+    return updated, changed
+
+
+def _video_material_settings(plan, submitted, materials, directory):
+    from .materials import videos_enabled
+    fields = ('video_refs', 'video_note', 'video_reference_source')
+    defaults = {} if materials is UNSET else materials
+    if not (videos_enabled(plan) or any(key in defaults for key in fields[:2])
+            or any(any(key in update for key in fields) for update in submitted)):
+        return None
+    if not plan.get('materials_version') and materials is UNSET:
+        raise ValueError('请先启用内置素材管理，再设置参考视频。')
+    from .video_materials import normalize_names, effective
+    candidate = copy.deepcopy(plan)
+    candidate['video_materials_version'] = 1
+    if 'video_refs' in defaults:
+        candidate['default_video_refs'] = normalize_names(defaults['video_refs'], directory)
+    if 'video_note' in defaults:
+        if not isinstance(defaults['video_note'], str):
+            raise ValueError('默认参考视频说明必须是文字。')
+        candidate['default_video_note'] = defaults['video_note'].strip()
+    default_value = effective(candidate, {'video_reference_source': 'default'}, directory)
+    values = [default_value]
+    for row, update in zip(candidate['segments'], submitted):
+        for key in fields:
+            if key in update:
+                row[key] = (normalize_names(update[key], directory) if key == 'video_refs' else update[key])
+        values.append(effective(candidate, row, directory))
+    for value in values:
+        if any(not 1 <= int(number) <= len(value['refs'])
+               for number in re.findall(r'@视频\s*(\d+)', value['note'])):
+            raise ValueError('参考视频说明引用了不存在的 @视频编号。')
+    return candidate
+
+
 def edit_plan(plan, submitted, directory=None, reference_default_count=UNSET, materials=UNSET):
     if plan.get("run_status") in {"running", "pausing", "stopping", "merging"}:
         raise ValueError("请等当前任务停止后再修改分段。")
     if len(submitted) != len(plan["segments"]):
         raise ValueError("首版支持移动切点；增删段请调整参数重新分析。")
+    video_settings = _video_material_settings(plan, submitted, materials, directory)
     if reference_default_count is not UNSET:
         plan["reference_default_count"] = normalize_default_reference_count(
             reference_default_count)
     sr = plan["sample_rate"]
     old_signatures = [segment_fingerprint(row) for row in plan["segments"]]
+    if video_settings is not None:
+        plan['video_materials_version'] = 1
+        for key in ('default_video_refs', 'default_video_note'):
+            if key in video_settings:
+                plan[key] = video_settings[key]
+        for row, candidate in zip(plan['segments'], video_settings['segments']):
+            for key in ('video_refs', 'video_note', 'video_reference_source'):
+                if key in candidate:
+                    row[key] = candidate[key]
     if materials is not UNSET:
         from .materials import effective
         plan['materials_version'] = 1

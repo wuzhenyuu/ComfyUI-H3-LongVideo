@@ -1,4 +1,6 @@
 import { api } from "../../scripts/api.js";
+import { openAssetLibrary, mergeLibraryImport } from "./asset_library.js";
+import { withUiLogging } from "./diagnostics.js";
 import {insertImageMention, mentionedImageNumbers, remapImageMentions} from "./material_mentions.js";
 
 function el(tag, parent, text) {
@@ -7,7 +9,7 @@ function el(tag, parent, text) {
   parent.append(item); return item;
 }
 
-export function materialEditor(parent, {projectId, index = 0, refs = [], note = "", defaults, source = "default", changed}) {
+export function materialEditor(parent, {projectId, index = 0, refs = [], note = "", defaults, source = "default", changed, getRevision}) {
   const box = el("section", parent); box.className = "h3lv-material-editor";
   const value = [...refs];
   let sourceSelect, copy;
@@ -23,6 +25,15 @@ export function materialEditor(parent, {projectId, index = 0, refs = [], note = 
   const upload = el("input", box); upload.type = "file"; upload.accept = "image/*"; upload.multiple = true; upload.hidden = true;
   const add = el("button", actions, "＋ 上传图片（最多 6 张）"); add.type = "button"; add.className = "h3lv-button";
   add.onclick = () => upload.click();
+  const library = el("button", actions, "从素材库选择"); library.type = "button"; library.className = "h3lv-button";
+  library.onclick = withUiLogging(async () => {
+    if (inherited() || uploading) return;
+    await openAssetLibrary({projectId, getRevision, currentCount:value.length, onImport:async (imported, choices) => {
+      if (!box.isConnected || inherited()) throw new Error("编辑器已关闭或已切换为继承，请重新打开素材库。");
+      const merged = mergeLibraryImport(value, customNote, imported, choices);
+      value.splice(0, value.length, ...merged.refs); customNote = merged.note; render(); changed();
+    }});
+  }, {source:"materials", action:"从素材库选择"});
   const mention = el("button", actions, "@ 引用图片"); mention.type = "button"; mention.className = "h3lv-button h3lv-mention-button";
   const textarea = el("textarea", box); textarea.className = "h3lv-material-note"; textarea.value = note;
   textarea.placeholder = "输入 @ 选择图片，例如：@图1 为人物三视图，@图2 为背景；三视图是同一个人。";
@@ -67,6 +78,8 @@ export function materialEditor(parent, {projectId, index = 0, refs = [], note = 
     const names = linked ? defaults().refs : value;
     textarea.value = linked ? defaults().note : customNote;
     textarea.disabled = Boolean(linked); add.disabled = Boolean(linked) || uploading; mention.disabled = Boolean(linked) || !names.length;
+    library.disabled = Boolean(linked) || uploading || !getRevision;
+    library.title = linked ? "选择本段自定义后可导入素材" : "";
     add.classList.toggle("is-inherited", Boolean(linked));
     mention.classList.toggle("is-unavailable", Boolean(linked) || !names.length);
     add.title = linked ? "选择“本段自定义”后可上传图片" : "";

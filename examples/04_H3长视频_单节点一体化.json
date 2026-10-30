@@ -2005,6 +2005,24 @@
           "links": [
             505
           ]
+        },
+        {
+          "localized_name": "video_1",
+          "name": "video_1",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "localized_name": "video_2",
+          "name": "video_2",
+          "type": "IMAGE",
+          "links": []
+        },
+        {
+          "localized_name": "video_3",
+          "name": "video_3",
+          "type": "IMAGE",
+          "links": []
         }
       ],
       "properties": {

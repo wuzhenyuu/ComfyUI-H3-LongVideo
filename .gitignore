@@ -11,3 +11,11 @@ settings.json
 output/
 input/
 models/
+
+.playwright-cli/
+.playwright-mcp/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx

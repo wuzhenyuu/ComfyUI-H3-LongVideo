@@ -1,8 +1,12 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { materialEditor } from "./materials.js";
+import { videoMaterialEditor, hasVideoConfiguration, appendVideoOutputs } from "./video_materials.js";
+import { attachPanelDrag } from "./panel_drag.js";
+import { openAssetLibrary } from "./asset_library.js";
 import { createTimeline, pcmWavePeaks } from "./timeline.js";
 import { generationOutputs } from "./video_outputs.js";
+import { createMusicEmotionActions, musicEmotionBlocked, musicEmotionSummary } from "./music_emotion.js";
 import { downloadErrorLog, reportUiError, withUiLogging } from "./diagnostics.js";
 
 if (!document.querySelector("link[data-h3lv-style]")) {
@@ -39,7 +43,7 @@ function actionButton(parent, label, action, className = "") {
       void reportUiError(error, {source: "h3lv", action: label});
       await messageDialog({title: "操作失败", message: error.message || String(error), tone: "error"});
     }
-    finally { node.disabled = false; }
+    finally { node.disabled = Boolean(node.h3lvLocked); }
   };
   return node;
 }
@@ -290,6 +294,101 @@ async function buildGenerationPayload() {
 
 const startingProjects = new Set();
 
+const generationActiveStatuses = ["running", "pausing", "stopping", "merging"];
+const generationUpgradeNotice = "后端尚未加载此功能，请重启ComfyUI并刷新";
+
+function existingGenerationVideo(row) {
+  if (row.job?.status === "completed" && row.job.video) return row.job;
+  const previous = row.replacement_previous_job;
+  return previous?.status === "completed" && previous.video ? previous : null;
+}
+
+function generationRetentionText(plan) {
+  const retained = (plan?.segments || []).filter(row => existingGenerationVideo(row));
+  const restoring = retained.filter(row => existingGenerationVideo(row) === row.replacement_previous_job).length;
+  return `已有 ${retained.length} 段视频可保留${restoring ? `（含 ${restoring} 段待恢复旧片）` : ""}`;
+}
+
+function reviewGenerationIsActive(plan) {
+  return plan?.run_status === "merging" || plan?.controller_active === true ||
+    (generationActiveStatuses.includes(plan?.run_status) && plan?.controller_active !== false);
+}
+
+function reviewGenerationBlocked(state, capability, checkStarting = true) {
+  const {plan, dirty, projectId} = state;
+  if (!plan || !projectId || plan.id !== projectId || !plan.segments?.length) return "没有可生成的分段，请先选择分析项目。";
+  if (plan.generation_capabilities?.[capability] !== true) return generationUpgradeNotice;
+  if (dirty) return "请先保存修改并重新确认。";
+  if (!plan.approved) return "请先保存并确认分段方案。";
+  if (plan.expansion_active) return "批量扩写进行中，请等待批次结束。";
+  if (plan.music_emotion_active) return "音乐情绪分析进行中，请等待或取消当前任务。";
+  if (reviewGenerationIsActive(plan) || (checkStarting && startingProjects.has(projectId))) return "生成任务正在进行，请等待当前任务结束。";
+  return "";
+}
+
+function createReviewGenerationActions({getState, requestProject, buildPayload, confirm, refresh, changed, notify}) {
+  let busy = false;
+  async function submit(capability, rawIndex) {
+    if (busy) throw new Error("生成任务正在启动，本次点击没有重复提交任务。");
+    const initial = getState();
+    const reason = reviewGenerationBlocked(initial, capability);
+    if (reason) throw new Error(reason);
+    const {projectId, plan} = initial;
+    const index = rawIndex === undefined || rawIndex === null || String(rawIndex).trim() === "" ? NaN : Number(rawIndex);
+    if (capability === "single_segment" && (!Number.isInteger(index) || !plan.segments.some(row => row.index === index))) {
+      throw new Error("请选择有效的分段。");
+    }
+    const revision = plan.revision;
+    const assertCurrent = () => {
+      const current = getState();
+      if (current.projectId !== projectId || current.plan?.id !== projectId || current.plan?.revision !== revision) {
+        throw new Error("分析项目或版本已改变，请刷新并确认后再生成。");
+      }
+      const blocked = reviewGenerationBlocked(current, capability, false);
+      if (blocked) throw new Error(blocked);
+    };
+    busy = true; startingProjects.add(projectId); changed();
+    try {
+      if (capability === "single_segment") {
+        const row = plan.segments.find(item => item.index === index);
+        if (!await confirm({title: `仅生成第 ${index+1} 段？`,
+          message: `本次只生成第 ${index+1} 段，完成后停止，不会继续后续分段。${existingGenerationVideo(row) ? "本段旧视频保留到新视频成功生成。" : "其他已有视频保持保留。"}`,
+          confirmText: "仅生成所选段"})) return;
+      }
+      const payload = await buildPayload();
+      assertCurrent();
+      const latest = await requestProject(projectId);
+      assertCurrent();
+      const blocked = reviewGenerationBlocked({plan: latest, projectId, dirty: false}, capability, false);
+      if (blocked) throw new Error(blocked);
+      if (latest.revision !== revision) throw new Error("项目已在其他窗口修改，请刷新并重新确认；本次没有提交生成任务。");
+      if (capability === "single_segment" && !latest.segments.some(row => row.index === index)) throw new Error("所选分段已改变，请刷新后重新选择。");
+      await requestProject(projectId, capability === "resume_unfinished" ? "/run" : "/regenerate",
+        capability === "resume_unfinished" ? {...payload, resume_unfinished: true, revision} : {...payload, index, revision});
+      notify(capability === "resume_unfinished" ? "已继续后续生成" : `已提交第 ${index+1} 段`,
+        capability === "resume_unfinished" ? `${generationRetentionText(plan)}。会检查并保留已有视频，包括待重生成的旧结果；从首个未完成或失败段继续。` : "本次只生成所选段，完成后停止；旧视频保留到新视频成功生成。");
+      if (getState().projectId === projectId && !getState().dirty) await refresh();
+    } finally {
+      busy = false; startingProjects.delete(projectId); changed();
+    }
+  }
+  return {resume: () => submit("resume_unfinished"), single: index => submit("single_segment", index),
+    get busy() { return busy; }};
+}
+
+function syncGenerationSegmentOptions(control, plan, auditionIndex, previousValue) {
+  control.replaceChildren();
+  for (const row of plan?.segments || []) {
+    const existing = existingGenerationVideo(row);
+    const state = existing && existing === row.replacement_previous_job ? "已有视频（待恢复）" :
+      (needsReplacement(row) ? "待重生成（保留旧片）" : (row.job?.status || "待生成"));
+    element("option", `第 ${row.index+1} 段 · ${Number(row.start).toFixed(3)}—${Number(row.end).toFixed(3)}s · ${state}`, control).value = String(row.index);
+  }
+  const indexes = (plan?.segments || []).map(row => String(row.index));
+  control.value = indexes.includes(previousValue) ? previousValue :
+    (indexes.includes(String(auditionIndex)) ? String(auditionIndex) : indexes[0] || "");
+}
+
 async function startApprovedSequence(owner, plan) {
   if (startingProjects.has(plan.id)) {
     toast("顺序生成正在启动", "本次点击没有重复提交任务。");
@@ -359,6 +458,8 @@ async function reanalyzeProject(owner, {ask = true} = {}) {
   if (projectWidget) projectWidget.value = "";
   const previous = document.getElementById("h3lv-panel");
   previous?.querySelector("canvas")?.disposeTimeline?.();
+  previous?.disposePanelDrag?.();
+  previous?.disposeMusicEmotion?.();
   previous?.remove();
   await analyzeOnly(owner);
   return true;
@@ -552,22 +653,24 @@ function statusText(plan) {
   const completed = plan.segments.filter(row => row.job?.status === "completed" && !needsReplacement(row)).length;
   const stale = plan.segments.filter(needsReplacement).length;
   return `状态：${plan.run_status} · ${plan.approved ? "已确认可生成" : "待确认"} · ${completed}/${plan.segments.length} 段可用`+
-    `${stale ? ` · ${stale}段待重生成` : ""}${plan.final_stale ? " · 当前成片为旧版" : ""}${plan.error ? ` · ${plan.error}` : ""}`;
+    `${stale ? ` · ${stale}段待重生成` : ""}${plan.final_stale ? " · 当前成片为旧版" : ""}${plan.error ? ` · ${plan.error}` : ""}${plan.expansion_active ? " · 批量扩写进行中，素材/分段暂只读" : ""}`;
 }
 
 async function openReview(owner) {
   const previous = document.getElementById("h3lv-panel");
   previous?.querySelector("canvas")?.disposeTimeline?.();
+  previous?.disposePanelDrag?.();
   previous?.remove();
   const shade = element("div", undefined, document.body, "h3lv-shade");
   shade.id = "h3lv-panel";
   shade.setAttribute("role", "dialog");
   shade.setAttribute("aria-modal", "true");
   shade.setAttribute("aria-label", "H3 长视频分段审核");
-  const panel = element("div", undefined, shade, "h3lv-panel");
+  const panel = element("div", undefined, shade, "h3lv-panel h3lv-review-panel");
   const header = element("header", undefined, panel, "h3lv-header");
   const titleRow = element("div", undefined, header, "h3lv-title-row");
   element("h2", "H3 长视频 · 音频切分审核", titleRow);
+  const disposePanelDrag = attachPanelDrag(panel, titleRow); shade.disposePanelDrag = disposePanelDrag;
   actionButton(titleRow, "关闭", async () => {
     if (dirty) {
       const decision = await confirmDialog({
@@ -582,7 +685,8 @@ async function openReview(owner) {
       if (decision !== "secondary") await saveAndApprove();
     }
     canvas.disposeTimeline?.();
-    shade.remove();
+    shade.disposeMusicEmotion?.();
+    disposePanelDrag(); shade.remove();
   }, "h3lv-close");
   const projectRow = element("div", undefined, header, "h3lv-project-row");
   const selectLabel = element("label", "分析项目", projectRow);
@@ -611,7 +715,8 @@ async function openReview(owner) {
       owner.setDirtyCanvas?.(true, true);
       clearVideoNodePreview();
       canvas.disposeTimeline?.();
-      shade.remove();
+      shade.disposeMusicEmotion?.();
+      disposePanelDrag(); shade.remove();
       toast("当前分析项目已删除", "请重新分析音频，或再次打开面板选择其他项目。");
       return;
     }
@@ -619,6 +724,7 @@ async function openReview(owner) {
     populateProjects(currentId);
     await load();
   }, "project-manager");
+  actionButton(projectRow, "素材库", () => openAssetLibrary());
   const defaultRow = element("label", "默认参考图张数", projectRow, "h3lv-default-references");
   const defaultSelect = element("select", undefined, defaultRow);
   defaultSelect.onchange = () => { if (plan) markDirty(); };
@@ -671,7 +777,8 @@ async function openReview(owner) {
   selectedAudio.controls = true;
   selectedAudio.preload = "metadata";
   const defaultMaterials = element("details", undefined, content, "h3lv-default-materials");
-  let defaultEditor = null;
+  let defaultEditor = null, defaultVideoEditor = null;
+  const defaultVideos = element("details", undefined, content, "h3lv-default-materials");
   const segmentsBody = element("section", undefined, content, "h3lv-segments");
   let plan = null;
   let analysis = null;
@@ -679,6 +786,12 @@ async function openReview(owner) {
   let details = [];
   let dirty = false;
   let selected = 0;
+  let generationSelectionProject = "";
+  let generationSelectionExplicit = false;
+  let loadVersion = 0;
+  let musicEmotionActions;
+  const emotionButtons = [];
+  const emotionLockedControls = new Map();
   const endpoint = (suffix = "") => `/h3lv/project/${encodeURIComponent(select.value)}${suffix}`;
   const state = () => ({plan, analysis, rows, selected});
 
@@ -687,6 +800,7 @@ async function openReview(owner) {
     const completed = plan.segments.filter(row => row.job?.status === "completed" && !needsReplacement(row)).length;
     status.textContent = `状态：draft · 修改未保存，尚不可生成 · ${completed}/${plan.segments.length} 段完成`;
     status.classList.add("is-dirty");
+    syncGenerationControls();
   }
   function previewUrl(index, vocals = false) {
     const start = index === 0 ? 0 : Number(rows[index-1].end.value);
@@ -724,6 +838,7 @@ async function openReview(owner) {
     selectedText.textContent = `当前试听（${selectedTrack === "vocals" ? "人声" : "原曲"}）：`+
       `第 ${selected+1} 段 · ${start.toFixed(3)}—${end.toFixed(3)}s`;
     if (refreshAudio) selectedAudio.src = selectedPreviewUrl(selected);
+    if (!generationSelectionExplicit) segmentGenerationSelect.value = String(plan.segments[selected].index);
     canvas.drawTimeline?.();
   }
   function refreshDraftDisplays() {
@@ -740,6 +855,7 @@ async function openReview(owner) {
     });
   }
   function moveBoundary(index, proposed) {
+    if (plan?.expansion_active || musicEmotionActions?.busy) return;
     const start = index === 0 ? 0 : Number(rows[index-1].end.value);
     const nextEnd = Number(rows[index+1].end.value);
     const lower = Math.max(start+3, nextEnd-plan.max_seconds);
@@ -820,7 +936,7 @@ async function openReview(owner) {
       segmentAudio.src = api.apiURL(endpoint(`/audio?index=${row.index}&revision=${plan.revision}`));
       let note, rowRefs, renderReferences, materialControls, visualTypeSelect;
       if (plan.materials_version) {
-        materialControls = materialEditor(inner, {projectId:plan.id, index:row.index,
+        materialControls = materialEditor(inner, {projectId:plan.id, index:row.index, getRevision:() => plan.revision,
           refs:row.refs || [], note:row.material_note || "",
           source:row.reference_source || (row.refs?.length ? "custom" : "default"),
           defaults:() => ({refs:defaultEditor.refs, note:defaultEditor.getNote()}), changed:markDirty});
@@ -942,6 +1058,10 @@ async function openReview(owner) {
         element("span", `音频判断：${audioHint}。选择后会立即重写本段导演简报；人物氛围和空镜不会使用人声参考。`,
           shotControl, "h3lv-shot-control-help");
       }
+      const videoControls = videoMaterialEditor(inner, {projectId:plan.id, getRevision:() => plan.revision,
+        refs:row.video_refs || [], note:row.video_note || "", source:row.video_reference_source || (row.video_refs?.length ? "custom" : "default"),
+        configured:hasVideoConfiguration(plan,row), defaults:() => defaultVideoEditor.getState(),
+        readOnly:!plan.materials_version || Boolean(plan.expansion_active), changed:markDirty});
       const promptActions = element("div", undefined, inner, "h3lv-actions h3lv-prompt-actions");
       const prompt = document.createElement("textarea");
       prompt.value = row.prompt || "";
@@ -983,6 +1103,9 @@ async function openReview(owner) {
         prompt.value = updated;
         prompt.dispatchEvent(new Event("input"));
       }, "prompt-edit");
+      const emotionButton = actionButton(promptActions, "分析本段音乐情绪", () => musicEmotionActions.start([row.index]));
+      emotionButtons.push(emotionButton);
+      element("p", musicEmotionSummary(row), inner, "h3lv-help");
       const directPrompt = element("details", undefined, inner, "h3lv-direct-prompt");
       element("summary", "手写提示词（segment_prompt 直连，可选）", directPrompt);
       element("p", "此处文字由长视频节点的 segment_prompt 原样输出。默认多图扩写接法不读取这里；只有手动把 segment_prompt 接到 H3 的 prompt 时才使用。",
@@ -992,7 +1115,7 @@ async function openReview(owner) {
       finalPrompt.placeholder = "粘贴或输入本段要直接发送给 H3 的提示词。插件不扩写、不校验、不回退。";
       finalPrompt.spellcheck = false;
       finalPrompt.oninput = markDirty;
-      rows.push({end, prompt, finalPrompt, note, materialControls, visualType:visualTypeSelect,
+      rows.push({end, prompt, finalPrompt, note, materialControls, videoControls, visualType:visualTypeSelect,
         refs: rowRefs, renderRefs: renderReferences, duration, time,
         generationFrames, editFrames, audio:segmentAudio});
       details.push(card);
@@ -1030,15 +1153,25 @@ async function openReview(owner) {
   }
 
   async function load() {
+    const version = ++loadVersion;
+    const projectId = select.value;
     if (!select.value) {
+      plan = null;
+      syncGenerationSegmentOptions(segmentGenerationSelect, null, 0);
+      syncGenerationControls();
       status.textContent = "还没有分析项目，请先运行 H3 音频分析节点。";
       notice.textContent = "没有可审核的项目。";
       return;
     }
-    plan = await request(endpoint());
-    if (!plan.materials_version && !plan.segments.some(row => row.job)) {
-      plan = await request(endpoint("/edit"), {revision:plan.revision, materials:{refs:[], note:""},
+    const loaded = await request(`/h3lv/project/${encodeURIComponent(projectId)}`);
+    if (!shade.isConnected || version !== loadVersion || select.value !== projectId) return;
+    plan = loaded;
+    if (!plan.expansion_active && !plan.music_emotion_active && !plan.materials_version && !plan.segments.some(row => row.job)) {
+      const migrated = await request(endpoint("/edit"), {revision:plan.revision, materials:{refs:[], note:""},
         segments:plan.segments.map(row => ({...row, reference_source:row.refs?.length ? "custom" : "default"}))});
+      if (version !== loadVersion || select.value !== projectId) return;
+      plan = {...migrated, generation_capabilities: loaded.generation_capabilities,
+        music_emotion_capabilities:loaded.music_emotion_capabilities, music_emotion_active:loaded.music_emotion_active};
     }
     syncDefaultReferenceControl();
     const defaultOpen = defaultMaterials.open;
@@ -1055,7 +1188,7 @@ async function openReview(owner) {
     if (plan.materials_version) {
       element("p", "上传一次，所有使用默认的分段自动继承；本段自定义的图片保持独立。",
         defaultHeaderText, "h3lv-help");
-      defaultEditor = materialEditor(defaultMaterials, {projectId:plan.id, refs:plan.default_refs || [],
+      defaultEditor = materialEditor(defaultMaterials, {projectId:plan.id, getRevision:() => plan.revision, refs:plan.default_refs || [],
         note:plan.default_material_note || "", changed:() => {markDirty(); rows.forEach(row => row.renderRefs());}});
     } else {
       element("p", "当前沿用画布参考图。启用内置素材后，请上传默认图并核对每段用途。",
@@ -1067,28 +1200,52 @@ async function openReview(owner) {
         await load();
       });
     }
-    analysis = await request(endpoint("/analysis"));
+    const videosOpen = defaultVideos.open;
+    defaultVideos.replaceChildren();
+    element("summary", "项目默认参考视频（可选）", defaultVideos, "h3lv-default-materials-header");
+    defaultVideos.open = videosOpen;
+    if (!plan.materials_version) element("p", "参考视频暂只读：请先在上方项目默认参考图区点击“启用内置素材管理”。", defaultVideos, "h3lv-help");
+    defaultVideoEditor = videoMaterialEditor(defaultVideos, {projectId:plan.id, getRevision:() => plan.revision,
+      refs:plan.default_video_refs || [], note:plan.default_video_note || "", configured:hasVideoConfiguration(plan),
+      readOnly:!plan.materials_version || Boolean(plan.expansion_active), changed:() => {markDirty(); rows.forEach(row => row.videoControls.render());}});
+    defaultVideoEditor.ready.then(() => rows.forEach(row => row.videoControls.render()));
+    const loadedAnalysis = await request(endpoint("/analysis"));
+    if (!shade.isConnected || version !== loadVersion || select.value !== projectId) return;
+    analysis = loadedAnalysis;
     if (widget) widget.value = plan.id;
     owner.properties = {...owner.properties, h3lv_project: plan.id};
     if (plan.final_preview) showFinalOnVideoNode(plan.final_preview, plan.id, plan.video_output_id);
     dirty = false; selected = Math.min(selected, plan.segments.length-1);
     status.textContent = statusText(plan);
     status.classList.remove("is-dirty");
-    const failedIndex = plan.segments.findIndex(row => row.job?.status === "failed");
-    runButton.textContent = failedIndex >= 0 ? `▶ 重试第 ${failedIndex+1} 段并继续` :
-      (["paused", "stopped"].includes(plan.run_status) ? "▶ 继续顺序生成" : "▶ 开始顺序生成");
+    runButton.textContent = "▶ 开始顺序生成";
+    const previousGenerationIndex = generationSelectionProject === plan.id ? segmentGenerationSelect.value : null;
+    if (generationSelectionProject !== plan.id) generationSelectionExplicit = false;
+    generationSelectionProject = plan.id;
+    syncGenerationSegmentOptions(segmentGenerationSelect, plan, selected, previousGenerationIndex);
     notice.textContent = analysis.available === false ? analysis.reason :
       `诊断：${analysis.phrases?.length || 0} 个识别句段 · ${analysis.sections?.length || 0} 个疑似无人声区 · `+
       `${analysis.rhythm?.tempo_bpm ? `约 ${analysis.rhythm.tempo_bpm} BPM（仅次级参考）` : "未取得稳定节拍参考"}`+
       ` · 运镜：${plan.mode === "speaking" ? "口播固定机位规则" : "唱歌动态规则"}`+
       `${analysis.legacy_notice ? ` · ${analysis.legacy_notice}` : ""}`;
+    emotionButtons.length = 0;
     renderCards();
+    if (plan.expansion_active) {
+      for (const root of [defaultMaterials, defaultVideos, segmentsBody]) {
+        root.querySelectorAll("input,textarea,select,button").forEach(control => {control.h3lvLocked = true; control.disabled = true;});
+      }
+    }
+    [saveButton, reanalyzeButton, runButton].forEach(control => {control.h3lvLocked = Boolean(plan.expansion_active); control.disabled = control.h3lvLocked;});
+    syncGenerationControls();
     updateSelected(selected);
     if (details[selected]) details[selected].open = true;
     if (plan.final_video && plan.final_preview?.filename) {
       const result = element("section", undefined, segmentsBody, "h3lv-result");
       const resultHeader = element("div", undefined, result, "h3lv-result-header");
       element("h3", plan.final_stale ? "当前旧版成片（有片段待更新）" : "合并结果", resultHeader);
+      if (plan.final_stale && plan.final_retained_stale_segments?.length) {
+        element("p", `本次合成保留了 ${plan.final_retained_stale_segments.length} 段旧视频，尚未全部匹配当前设置。`, result, "h3lv-help");
+      }
       const revealButton = actionButton(resultHeader, "打开文件位置", async () => {
         await request(endpoint("/reveal-final"), {});
         revealButton.textContent = "已打开并选中文件";
@@ -1101,20 +1258,31 @@ async function openReview(owner) {
       video.playsInline = true;
       video.src = outputPreviewUrl(plan.final_preview);
     }
+    syncMusicEmotionControls();
+    await musicEmotionActions.connect(plan);
   }
 
   async function saveDraft() {
+    if (plan?.expansion_active) throw new Error("批量扩写进行中，素材/分段暂只读，请等待批次结束。");
+    if (plan?.music_emotion_active) throw new Error("音乐情绪分析进行中，请等待或取消当前任务。");
+    const projectId = select.value;
     let revision = plan.revision;
     if (dirty) {
       const saved = await request(endpoint("/edit"), {revision,
         reference_default_count: defaultSelect.value === "all" ? null : Number(defaultSelect.value),
-        ...(plan.materials_version ? {materials:{refs:defaultEditor.refs, note:defaultEditor.getNote()}} : {}),
+        ...((plan.materials_version || Object.keys(defaultVideoEditor.getDefaultPayload()).length) ? {materials:{
+          ...(plan.materials_version ? {refs:defaultEditor.refs, note:defaultEditor.getNote()} : {}),
+          ...defaultVideoEditor.getDefaultPayload()}} : {}),
         segments: rows.map(row => ({end: Number(row.end.value), prompt: row.prompt.value,
-          final_prompt: row.finalPrompt.value,
+          final_prompt: row.finalPrompt.value, ...row.videoControls.getPayload(),
           material_note: row.materialControls ? row.materialControls.getNote() : row.note.value, refs: row.refs,
           ...(row.materialControls ? {reference_source:row.materialControls.source.value,
             visual_type:row.visualType.value, brief_matches_visual_type:true} : {})}))});
-      plan = saved; revision = saved.revision; dirty = false;
+      if (!shade.isConnected || select.value !== projectId) throw new Error("已切换分析项目，请在当前项目重新操作。");
+      plan = {...saved, generation_capabilities:plan.generation_capabilities,
+        music_emotion_capabilities:plan.music_emotion_capabilities, music_emotion_active:plan.music_emotion_active};
+      revision = saved.revision; dirty = false;
+      status.textContent = statusText(plan); status.classList.remove("is-dirty");
     }
     return revision;
   }
@@ -1125,7 +1293,7 @@ async function openReview(owner) {
     dirty = false;
     return approved;
   }
-  actionButton(controls, "保存并确认", async () => {
+  const saveButton = actionButton(controls, "保存并确认", async () => {
     if (!await confirmDialog({
       title: "保存并确认分段？",
       message: "请确认已经试听并检查所有切点。保存后，这个项目将允许开始顺序生成。",
@@ -1134,35 +1302,71 @@ async function openReview(owner) {
     try {await saveAndApprove();}
     finally {await load();}
   }, "primary");
-  actionButton(controls, "重新分析分段", async () => {
+  const reanalyzeButton = actionButton(controls, "重新分析分段", async () => {
     await reanalyzeProject(owner);
   });
   const runButton = actionButton(controls, "▶ 开始顺序生成", async () => {
+    if (musicEmotionActions.busy) throw new Error("音乐情绪分析进行中，请等待或取消当前任务。");
     if (dirty) throw new Error("请先保存修改并重新确认。");
     if (!plan?.approved) throw new Error("请先确认分段。");
-    const payload = await buildGenerationPayload();
-    const failedIndex = plan.segments.findIndex(row => row.job?.status === "failed");
-    if (failedIndex >= 0) {
-      const failedRow = plan.segments[failedIndex];
-      const failureReason = String(failedRow.job?.error || "上一次任务被停止，或节点没有生成可用视频。");
-      const decision = await confirmDialog({
-        title: `第 ${failedIndex + 1} 段上次没有生成完成`,
-        message: `原因：${failureReason}\n\n将重新生成第 ${failedIndex + 1} 段；成功后自动继续后续分段。`,
-        confirmText: `重跑第 ${failedIndex + 1} 段并继续`,
-        secondaryText: "重新分析分段",
-      });
-      if (decision === "secondary") {
-        await reanalyzeProject(owner, {ask: false});
-        return;
+    if (startingProjects.has(plan.id) || generationActiveStatuses.includes(plan.run_status)) throw new Error("生成任务正在进行，请等待当前任务结束。");
+    const projectId = plan.id;
+    startingProjects.add(projectId); syncGenerationControls();
+    try {
+      const payload = await buildGenerationPayload();
+      const failedIndex = plan.segments.findIndex(row => row.job?.status === "failed");
+      if (failedIndex >= 0) {
+        const failedRow = plan.segments[failedIndex];
+        const failureReason = String(failedRow.job?.error || "上一次任务被停止，或节点没有生成可用视频。");
+        const decision = await confirmDialog({
+          title: `第 ${failedIndex + 1} 段上次没有生成完成`,
+          message: `原因：${failureReason}\n\n将重新生成第 ${failedIndex + 1} 段；成功后自动继续后续分段。`,
+          confirmText: `重跑第 ${failedIndex + 1} 段并继续`,
+          secondaryText: "重新分析分段",
+        });
+        if (decision === "secondary") {
+          await reanalyzeProject(owner, {ask: false});
+          return;
+        }
+        if (!decision) return;
+        await request(endpoint("/retry"), {index: failedIndex});
+        payload.replace_snapshot = true;
       }
-      if (!decision) return;
-      await request(endpoint("/retry"), {index: failedIndex});
-      payload.replace_snapshot = true;
-    }
-    await request(endpoint("/run"), payload);
-    clearVideoNodePreview(payload.video_id);
-    await load();
+      await request(endpoint("/run"), payload);
+      clearVideoNodePreview(payload.video_id);
+      await load();
+    } finally {startingProjects.delete(projectId); syncGenerationControls();}
   }, "run");
+  const generationActions = createReviewGenerationActions({
+    getState: () => ({plan: plan && {...plan, music_emotion_active:musicEmotionActions.busy}, dirty, projectId: select.value}),
+    requestProject: (id, suffix = "", body) => request(`/h3lv/project/${encodeURIComponent(id)}${suffix}`, body),
+    buildPayload: buildGenerationPayload, confirm: confirmDialog, refresh: load,
+    changed: () => syncGenerationControls(), notify: toast,
+  });
+  const resumeButton = actionButton(controls, "▶ 继续后续生成", () => generationActions.resume(), "resume");
+  const segmentGenerationLabel = element("label", "生成指定段", controls, "h3lv-generation-segment");
+  const segmentGenerationSelect = element("select", undefined, segmentGenerationLabel);
+  segmentGenerationSelect.setAttribute("aria-label", "选择仅生成的分段");
+  segmentGenerationSelect.onchange = () => {generationSelectionExplicit = true;};
+  const singleGenerationButton = actionButton(controls, "仅生成所选段", () => generationActions.single(segmentGenerationSelect.value), "single-segment");
+  const generationHelp = element("span", "", controls, "h3lv-help");
+  function syncGenerationControls() {
+    for (const [button, capability] of [[resumeButton, "resume_unfinished"], [singleGenerationButton, "single_segment"]]) {
+      const reason = musicEmotionActions?.busy ? "音乐情绪分析进行中，请等待或取消当前任务。" : generationActions.busy ? "生成任务正在启动。" : reviewGenerationBlocked({plan, dirty, projectId: select.value}, capability);
+      button.h3lvLocked = Boolean(reason); button.disabled = button.h3lvLocked;
+      button.title = reason || (capability === "resume_unfinished" ? "检查并保留已有视频，从首个未完成或失败段继续。" : "只生成所选段，完成后停止。");
+    }
+    segmentGenerationSelect.disabled = !plan?.segments.length || musicEmotionActions?.busy || generationActions.busy || Boolean(plan?.expansion_active) || reviewGenerationIsActive(plan);
+    if (generationActions.busy || startingProjects.has(plan?.id)) {
+      runButton.h3lvLocked = true; runButton.disabled = true;
+    } else {
+      runButton.h3lvLocked = Boolean(plan?.expansion_active) || musicEmotionActions?.busy || generationActiveStatuses.includes(plan?.run_status);
+      runButton.disabled = runButton.h3lvLocked;
+    }
+    generationHelp.textContent = plan && (plan.generation_capabilities?.resume_unfinished !== true || plan.generation_capabilities?.single_segment !== true) ?
+      generationUpgradeNotice : `${generationRetentionText(plan)}。继续会检查并保留已有视频（含待重生成旧片）；开始按当前设置处理待重生成片段。`;
+    if (musicEmotionActions) syncMusicEmotionControls();
+  }
   actionButton(controls, "当前段完成后暂停", async () => {
     await request(endpoint("/pause"), {}); await load();
   }, "pause");
@@ -1180,21 +1384,80 @@ async function openReview(owner) {
     await request(endpoint("/assemble"), {}); await load();
   });
   actionButton(controls, "刷新状态", load);
+  const emotionControls = element("div", undefined, header, "h3lv-actions");
+  const emotionAllButton = actionButton(emotionControls, "分析全部音乐情绪", () => musicEmotionActions.start(plan.segments.map(row => row.index)));
+  const emotionCancelButton = actionButton(emotionControls, "取消情绪分析", () => musicEmotionActions.cancel(), "stop");
+  const emotionRefreshButton = actionButton(emotionControls, "刷新情绪状态", () => musicEmotionActions.refreshStatus());
+  const emotionStatus = element("span", "", emotionControls, "h3lv-help");
+  emotionStatus.setAttribute("role", "status");
+  musicEmotionActions = createMusicEmotionActions({
+    getState: () => ({plan, projectId:select.value, generationBusy:generationActions.busy || startingProjects.has(select.value)}),
+    requestProject: (id, suffix, body) => request(`/h3lv/project/${encodeURIComponent(id)}${suffix}`, body),
+    saveDraft, refresh: async id => {if (shade.isConnected && select.value === id) await load();},
+    changed: () => syncGenerationControls(),
+  });
+  shade.disposeMusicEmotion = () => {loadVersion += 1; musicEmotionActions.dispose();};
+  function syncMusicEmotionControls() {
+    const active = Boolean(musicEmotionActions?.busy);
+    if (!active) {
+      for (const [control, previous] of emotionLockedControls) {
+        control.disabled = previous.disabled; control.h3lvLocked = previous.locked;
+      }
+      emotionLockedControls.clear();
+    }
+    const reason = active ? "音乐情绪分析进行中，请等待或取消当前任务。" :
+      musicEmotionBlocked({plan, projectId:select.value, generationBusy:generationActions.busy || startingProjects.has(select.value)});
+    for (const button of [emotionAllButton, ...emotionButtons]) {
+      button.h3lvLocked = Boolean(reason); button.disabled = button.h3lvLocked; button.title = reason;
+    }
+    const supported = plan?.music_emotion_capabilities?.analyze === true;
+    emotionCancelButton.hidden = !supported || !active;
+    emotionCancelButton.h3lvLocked = !active || Boolean(musicEmotionActions?.cancelling) ||
+      (musicEmotionActions?.result?.job?.status !== "running" && !plan?.music_emotion_active);
+    emotionCancelButton.disabled = emotionCancelButton.h3lvLocked;
+    emotionRefreshButton.hidden = !supported;
+    const result = musicEmotionActions?.result, job = result?.job;
+    emotionStatus.textContent = musicEmotionActions?.error || (!supported ? reason :
+      job?.status === "running" ? `音乐情绪分析 ${job.done}/${job.total} 段完成${Number.isInteger(job.index) ? ` · 正在分析第 ${job.index+1} 段` : ""}，素材与分段暂只读。` :
+      active ? "正在准备音乐情绪分析，素材与分段暂只读。" :
+      job?.status === "completed" ? "音乐情绪分析已完成，结果已写入各段导演简报。" :
+      job?.status === "failed" ? `音乐情绪分析失败：${job.error || "请检查本地模型配置后重试。"}` :
+      job?.status === "cancelled" ? "情绪分析已取消，可以继续编辑或重新分析。" :
+      result?.ready === false ? "本地音乐分析模型未就绪，请完成模型准备后重试。" : "按当前切点分析原曲，并把音乐情绪写入导演简报；关闭面板后后台继续。");
+    for (const root of [defaultMaterials, defaultVideos, segmentsBody]) {
+      root.inert = active;
+      root.setAttribute("aria-busy", String(active));
+      if (active) root.querySelectorAll("input,textarea,select,button").forEach(control => {
+        if (emotionButtons.includes(control)) return;
+        if (!emotionLockedControls.has(control)) emotionLockedControls.set(control, {disabled:control.disabled, locked:control.h3lvLocked});
+        control.disabled = true; control.h3lvLocked = true;
+      });
+    }
+    controls.inert = active;
+    for (const control of [defaultSelect, saveButton, reanalyzeButton]) {
+      control.h3lvLocked = active || Boolean(plan?.expansion_active); control.disabled = control.h3lvLocked;
+    }
+  }
   select.onchange = () => {
+    musicEmotionActions.switchProject(select.value);
     selected = 0;
+    generationSelectionExplicit = false;
+    syncGenerationControls();
     load().catch(error => messageDialog({title: "项目加载失败", message: error.message, tone: "error"}));
   };
   await load();
   const timer = setInterval(async () => {
-    if (!shade.isConnected) { clearInterval(timer); canvas.disposeTimeline?.(); return; }
-    if (dirty || !plan || !["running", "pausing", "stopping", "merging"].includes(plan.run_status)) return;
+    if (!shade.isConnected) { clearInterval(timer); musicEmotionActions.dispose(); canvas.disposeTimeline?.(); disposePanelDrag(); return; }
+    if (dirty || !plan || (!plan.expansion_active && !["running", "pausing", "stopping", "merging"].includes(plan.run_status))) return;
+    const projectId = select.value, version = loadVersion;
     try {
       const latest = await request(endpoint());
+      if (!shade.isConnected || select.value !== projectId || version !== loadVersion) return;
       status.textContent = statusText(latest);
       const oldDone = plan.segments.filter(row => row.job?.status === "completed").length;
       const newDone = latest.segments.filter(row => row.job?.status === "completed").length;
-      if (latest.run_status !== plan.run_status || oldDone !== newDone) await load();
-    } catch (error) { status.textContent = error.message; }
+      if (latest.run_status !== plan.run_status || latest.expansion_active !== plan.expansion_active || latest.controller_active !== plan.controller_active || oldDone !== newDone) await load();
+    } catch (error) { if (shade.isConnected && select.value === projectId && version === loadVersion) status.textContent = error.message; }
   }, 2000);
 }
 
@@ -1290,7 +1553,9 @@ app.registerExtension({
           if (widget) widget.value = values[index];
         });
       }
-      return oldConfigured?.call(this, info);
+      const result = oldConfigured?.call(this, info);
+      appendVideoOutputs(this);
+      return result;
     };
     const oldCreated = nodeType.prototype.onNodeCreated;
     nodeType.prototype.onNodeCreated = function () {

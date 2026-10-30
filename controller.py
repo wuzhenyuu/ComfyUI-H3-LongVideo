@@ -82,10 +82,12 @@ def refresh_expansion_settings(snapshot, current_prompt):
         inputs, source = node['inputs'], current[key]['inputs']
         if inputs.get('material') != source.get('material'):
             raise ValueError('扩写素材连线已变化，请通过重新生成本段更新工作流快照。')
-        for field in ('mode', 'model', 'rule', 'revision'):
+        optional = ('provider', 'codex_model', 'codex_reasoning', 'codex_timeout')
+        for field in ('mode', 'model', 'rule', 'revision', *optional):
             if isinstance(source.get(field), (list, tuple)):
                 raise ValueError('扩写设置改成了连线输入，请通过重新生成本段更新工作流快照。')
             if field in source: inputs[field] = copy.deepcopy(source[field])
+            elif field in optional: inputs.pop(field, None)
 
 
 def normalize_output_contract(snapshot):
@@ -280,6 +282,15 @@ def apply_segment_references(prompt, plan, row, directory):
                 inputs.pop(key)
         for i in range(len(value['refs'])):
             inputs[f'ref_images.ref_image_{i}'] = [loaders[0], 5+i]
+        from .materials import videos_enabled
+        if videos_enabled(plan):
+            from .video_materials import effective as effective_videos
+            videos = effective_videos(plan, row, directory)
+            for key in list(inputs):
+                if key.startswith(('ref_videos.ref_video_', 'ref_video_audios.ref_video_audio_')):
+                    inputs.pop(key)
+            for i in range(len(videos['refs'])):
+                inputs[f'ref_videos.ref_video_{i}'] = [loaders[0], 13+i]
         if value['visual_type'] in {'atmosphere', 'environment'}:
             for key in list(inputs):
                 if key.startswith('ref_audios.ref_audio_'): inputs.pop(key)
@@ -332,13 +343,17 @@ def validate_generation_materials(plan, directory, indices=None):
     """Validate only the segments that are about to be submitted for generation."""
     if not plan.get("materials_version"):
         return
-    from .materials import effective
+    from .materials import effective, videos_enabled
+    check_videos = videos_enabled(plan)
     targets = range(len(plan["segments"])) if indices is None else indices
     missing = []
     for index in targets:
         try:
             effective(plan, plan["segments"][index], directory, require=True)
-        except ValueError as exc:
+            if check_videos:
+                from .video_materials import effective as effective_videos
+                effective_videos(plan, plan['segments'][index], directory)
+        except (ValueError, OSError) as exc:
             if "没有有效参考图" not in str(exc):
                 raise ValueError(f"第 {index + 1} 段：{exc}") from exc
             missing.append(index + 1)
@@ -349,16 +364,126 @@ def validate_generation_materials(plan, directory, indices=None):
             "“本段自定义”并上传图片后再开始生成。")
 
 
+RUN_SNAPSHOT_NAME = re.compile(r"^run_snapshot_[0-9a-f]{32}\.json$")
+
+
+def run_snapshot_path(directory, name=None):
+    """Resolve only plugin-owned state basenames, including the legacy snapshot."""
+    name = "queue_snapshot.json" if name is None else name
+    if not isinstance(name, str) or (name != "queue_snapshot.json"
+                                    and not RUN_SNAPSHOT_NAME.fullmatch(name)):
+        raise ValueError("生成工作流快照文件名无效。")
+    state = directory / "state"
+    return inside(state, state / name)
+
+
+def read_run_snapshot(directory, name=None):
+    path = run_snapshot_path(directory, name)
+    return normalize_output_contract(json.loads(path.read_text(encoding="utf-8")))
+
+
+def current_run_snapshot(payload):
+    prompt = copy.deepcopy(payload.get("prompt", {}))
+    loader, video = str(payload.get("loader_id", "")), str(payload.get("video_id", ""))
+    if not isinstance(prompt, dict) or prompt.get(loader, {}).get("class_type") not in SEGMENT_NODE_TYPES:
+        raise ValueError("请打开含 H3 分段读取节点或一体化节点的视频工作流。")
+    video_rate_input(prompt, video)
+    snapshot = normalize_output_contract({
+        "prompt": prompt, "loader_id": loader, "video_id": video,
+        "workflow": copy.deepcopy(payload.get("workflow", {})),
+        "client_id": str(payload.get("client_id") or "").strip(),
+        "output_contract_version": OUTPUT_CONTRACT_VERSION,
+        "prompt_rule_source": "workflow",
+    })
+    snapshot["generation_graph_fingerprint"] = generation_graph_fingerprint(snapshot)
+    return snapshot
+
+
+def validate_retained_videos(plan, directory):
+    size = None
+    for index, row in enumerate(plan["segments"]):
+        job = row.get("job", {})
+        if job.get("status") != "completed":
+            continue
+        try:
+            path = inside(directory, job.get("video", ""))
+            if not path.is_file():
+                raise ValueError("原视频文件缺失")
+            info = probe_video(path)
+            dimensions = (int(info["width"]), int(info["height"]))
+            if min(dimensions) <= 0:
+                raise ValueError("原视频尺寸无效")
+            if size is not None and dimensions != size:
+                raise ValueError("原视频与其他保留片段的分辨率不一致")
+            numerator, denominator = str(info["r_frame_rate"]).split("/")
+            fps = float(numerator) / float(denominator)
+            if not abs(fps - 24) <= .001:
+                raise ValueError("原视频不是 24fps")
+            if int(info["nb_read_frames"]) < row["edit_frames"]:
+                raise ValueError("原视频帧数不足")
+            size = dimensions
+        except Exception as exc:
+            raise ValueError(f"第 {index + 1} 段保留视频无法使用：{exc}。请单独重新生成本段后再继续。") from exc
+
+
+def restore_interrupted_replacements(plan, server):
+    """Recover the explicit prior take left by old validation-stage failures."""
+    for index, row in enumerate(plan["segments"]):
+        previous = row.get("replacement_previous_job")
+        job = row.get("job")
+        if not previous or previous.get("status") != "completed" or not previous.get("video"):
+            continue
+        if job and job.get("status") != "failed":
+            continue
+        if job:
+            if job.get("prompt_id") in queued_ids(server):
+                raise ValueError(f"第 {index + 1} 段失败任务仍在队列中，请等待结束后再继续。")
+            row.setdefault("failed_attempts", []).append(copy.deepcopy(job))
+        row["job"] = copy.deepcopy(previous)
+        row.pop("replacement_previous_job", None)
+        row["needs_regeneration"] = True
+        row.setdefault("regeneration_reason", "上次替换生成未完成，继续保留原视频")
+
+
+def prepare_selective_jobs(plan, directory, indices, server):
+    """Freeze recoverable queued jobs and explicit failed-job retries in memory."""
+    existing = [(index, plan["segments"][index].get("job")) for index in indices]
+    if not any(job and job.get("status") in {"failed", "queued"} for _, job in existing):
+        return
+    active_ids = queued_ids(server)
+    for index, job in existing:
+        if not job or job.get("status") == "completed":
+            continue
+        prompt_id = job.get("prompt_id")
+        if job.get("status") == "failed":
+            if prompt_id in active_ids:
+                raise ValueError(f"第 {index + 1} 段失败任务仍在队列中，请等待结束后再继续。")
+            plan["segments"][index].setdefault("failed_attempts", []).append(copy.deepcopy(job))
+            plan["segments"][index].pop("job", None)
+            continue
+        history = server.prompt_queue.get_history(prompt_id=prompt_id).get(prompt_id) if prompt_id else None
+        if not prompt_id or (prompt_id not in active_ids and not history):
+            raise ValueError(f"第 {index + 1} 段任务记录不在队列/历史中，不会自动重复提交；请单独重试本段。")
+        name = job.get("snapshot_file") or plan.get("run_snapshot") or "queue_snapshot.json"
+        saved = read_run_snapshot(directory, name)
+        if not saved.get("video_id"):
+            raise ValueError(f"第 {index + 1} 段原工作流快照缺少视频输出节点，无法安全恢复。")
+        job["snapshot_file"] = name
+        job.setdefault("video_id", saved["video_id"])
+
+
 async def execute_project(root, project_id, server):
     import execution
     import folder_paths
     stage, index, prompt_id = "workflow_snapshot", None, None
     try:
         directory = project_path(root, project_id)
-        snapshot_file = directory/"state"/"queue_snapshot.json"
-        snapshot = normalize_output_contract(json.loads(snapshot_file.read_text(encoding="utf-8")))
-        snapshot_file.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
         initial_plan = read_plan(root, project_id)
+        snapshot_name = initial_plan.get("run_snapshot") or "queue_snapshot.json"
+        snapshot = read_run_snapshot(directory, snapshot_name)
+        resume_unfinished = initial_plan.get("run_mode") == "resume_unfinished"
+        if resume_unfinished:
+            validate_retained_videos(initial_plan, directory)
         only_segment = initial_plan.get("run_only_segment")
         indices = ([int(only_segment)] if only_segment is not None
                    else range(len(initial_plan["segments"])))
@@ -371,7 +496,8 @@ async def execute_project(root, project_id, server):
                 write_plan(root, plan)
                 return
             row = plan["segments"][index]
-            if row.get("job", {}).get("status") == "completed" and not row.get("needs_regeneration"):
+            if row.get("job", {}).get("status") == "completed" \
+                    and (resume_unfinished or not row.get("needs_regeneration")):
                 continue
             if not plan.get("approved") or plan.get("approved_fingerprint") != fingerprint(plan):
                 raise ValueError("方案已变化，请重新审核确认。")
@@ -395,7 +521,12 @@ async def execute_project(root, project_id, server):
                 if not valid[0]:
                     raise ValueError("视频工作流校验失败："+str(valid[1]))
                 # Save intent before enqueue; uncertain interrupted jobs are never blindly resubmitted.
-                row["job"] = job = {"prompt_id": prompt_id, "status": "queued"}
+                row["job"] = job = {
+                    "prompt_id": prompt_id, "status": "queued", "snapshot_file": snapshot_name,
+                    "video_id": snapshot["video_id"],
+                    "generation_graph_fingerprint": snapshot.get("generation_graph_fingerprint")
+                        or generation_graph_fingerprint(snapshot),
+                }
                 write_plan(root, plan)
                 extra = {
                     "extra_pnginfo": {"workflow": snapshot.get("workflow", {})},
@@ -411,6 +542,9 @@ async def execute_project(root, project_id, server):
                 stage = "queue_submit"
                 server.prompt_queue.put((number, prompt_id, prompt, extra, valid[2], {}))
             prompt_id = job["prompt_id"]
+            job_snapshot = (snapshot if job.get("snapshot_file", snapshot_name) == snapshot_name
+                            else read_run_snapshot(directory, job["snapshot_file"]))
+            job_video_id = job.get("video_id") or job_snapshot["video_id"]
             stage = "segment_generation"
             while True:
                 history = server.prompt_queue.get_history(prompt_id=prompt_id).get(prompt_id)
@@ -426,7 +560,7 @@ async def execute_project(root, project_id, server):
             row = plan["segments"][index]
             try:
                 record_history_error(history, project_id=project_id, segment_index=index, prompt_id=prompt_id)
-                video = video_from_history(history, snapshot["video_id"], directory, folder_paths.get_output_directory())
+                video = video_from_history(history, job_video_id, directory, folder_paths.get_output_directory())
                 row["job"].update(status="completed", video=video,
                                   input_fingerprint=segment_fingerprint(row))
                 final_prompt = final_prompt_from_history(history)
@@ -449,7 +583,7 @@ async def execute_project(root, project_id, server):
             if preview and callable(getattr(server, "send_sync", None)):
                 server.send_sync("h3lv-segment", {
                     "project_id": project_id, "segment_index": index, "preview": preview,
-                    "video_id": snapshot["video_id"]})
+                    "video_id": job_video_id})
         plan = read_plan(root, project_id)
         if only_segment is not None:
             plan.pop("run_only_segment", None)
@@ -470,7 +604,10 @@ async def execute_project(root, project_id, server):
                 versions = plan.setdefault("final_versions", [])
                 if previous_final not in versions:
                     versions.append(previous_final)
-            plan.update(run_status="completed", final_video=final, final_stale=False)
+            retained_stale = [i for i, row in enumerate(plan["segments"])
+                              if row.get("needs_regeneration")]
+            plan.update(run_status="completed", final_video=final, final_stale=bool(retained_stale))
+            plan["final_retained_stale_segments"] = retained_stale
         write_plan(root, plan)
         preview = output_preview(folder_paths.get_output_directory(), plan.get("final_video"))
         if preview and callable(getattr(server, "send_sync", None)):
@@ -479,6 +616,15 @@ async def execute_project(root, project_id, server):
     except Exception as exc:
         record_error(stage, exc, project_id=project_id, segment_index=index, prompt_id=prompt_id)
         plan = read_plan(root, project_id)
+        if index is not None:
+            row = plan["segments"][index]
+            previous_job = row.pop("replacement_previous_job", None)
+            if previous_job:
+                failed = copy.deepcopy(row.get("job") or {"prompt_id": prompt_id})
+                failed.update(status="failed", error=str(exc))
+                row.setdefault("failed_attempts", []).append(failed)
+                row["job"] = previous_job
+                row["needs_regeneration"] = True
         plan.pop("run_only_segment", None)
         plan.update(run_status="failed", error=str(exc))
         write_plan(root, plan)
@@ -489,17 +635,64 @@ async def execute_project(root, project_id, server):
 @logged("generation_start")
 def start(root, project_id, payload, server):
     with LOCK:
+        from .expansion_jobs import active
+        from .music_emotion import require_inactive
+        require_inactive()
+        if active(project_id):
+            raise ValueError('该项目正在批量扩写，请等待完成或取消后再生成视频。')
         if project_id in TASKS:
             raise ValueError("该项目已经在生成中。")
         plan = read_plan(root, project_id)
         if not plan.get("approved") or plan.get("approved_fingerprint") != fingerprint(plan):
             raise ValueError("请先保存并确认分段方案。")
         directory = project_path(root, project_id)
+        if "resume_unfinished" in payload and type(payload["resume_unfinished"]) is not bool:
+            raise ValueError("resume_unfinished 必须为布尔值。")
+        resume_unfinished = payload.get("resume_unfinished", False)
         only_segment = payload.get("only_segment_index")
+        if resume_unfinished and only_segment is not None:
+            raise ValueError("继续后续生成不能同时指定单段生成。")
+        if (resume_unfinished or only_segment is not None) and "revision" in payload:
+            revision = payload["revision"]
+            if type(revision) is not int or revision != plan.get("revision"):
+                raise ValueError("分段方案版本已变化，请刷新后重试。")
         if only_segment is not None:
-            only_segment = int(only_segment)
-            if not 0 <= only_segment < len(plan["segments"]):
+            if type(only_segment) is not int or not 0 <= only_segment < len(plan["segments"]):
                 raise ValueError("要重新生成的片段编号无效。")
+        if resume_unfinished or only_segment is not None:
+            # Validate and freeze all decisions before writing snapshots or the plan.
+            snapshot = current_run_snapshot(payload)
+            if resume_unfinished:
+                restore_interrupted_replacements(plan, server)
+                validate_retained_videos(plan, directory)
+                generation_indices = [i for i, row in enumerate(plan["segments"])
+                                      if row.get("job", {}).get("status") != "completed"]
+            else:
+                generation_indices = [only_segment]
+                if plan["segments"][only_segment].get("job", {}).get("status") == "completed":
+                    request_regeneration(plan["segments"][only_segment], "仅重新生成所选段")
+            prepare_selective_jobs(plan, directory, generation_indices, server)
+            submitting = [i for i in generation_indices if not plan["segments"][i].get("job")
+                          or plan["segments"][i].get("needs_regeneration")]
+            validate_generation_materials(plan, directory, submitting)
+            snapshot_name = f"run_snapshot_{uuid.uuid4().hex}.json"
+            snapshot_file = run_snapshot_path(directory, snapshot_name)
+            if resume_unfinished:
+                plan["run_mode"] = "resume_unfinished"
+                plan.pop("run_only_segment", None)
+            else:
+                plan.pop("run_mode", None)
+                plan["run_only_segment"] = only_segment
+                if plan.get("final_video"):
+                    plan["final_stale"] = True
+            plan.update(run_snapshot=snapshot_name, run_status="running", pause_requested=False,
+                        stop_requested=False, error="", video_output_id=snapshot["video_id"])
+            snapshot_file.write_text(json.dumps(snapshot, ensure_ascii=False), encoding="utf-8")
+            write_plan(root, plan)
+            TASKS[project_id] = asyncio.create_task(execute_project(root, project_id, server))
+            return
+        plan.pop("run_mode", None)
+        plan.pop("run_snapshot", None)
         snapshot_file = directory/"state"/"queue_snapshot.json"
         replace_snapshot = bool(payload.get("replace_snapshot"))
         current_snapshot = None
